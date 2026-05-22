@@ -1,7 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const fs = require("fs");
-const path = require("path");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
@@ -10,71 +9,79 @@ const BASE_URL = "https://googler.fast-gen.ai";
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const userState = {};
 
-const MODELS = {
-  "flower_img":  { label: "🌸 Flower Image",   type: "image",       endpoint: "/api/v4/flower/image/generate" },
-  "flow_img":    { label: "⚡ Flow Image",      type: "image",       endpoint: "/api/v4/flow/image/generate" },
-  "grok_img":    { label: "🤖 Grok Image",      type: "image",       endpoint: "/api/v4/grok/image/generate" },
-  "openai_img":  { label: "🧠 OpenAI Image",    type: "image",       endpoint: "/api/v4/openai/image/generate" },
-  "flower_vt":   { label: "🌸 Flower Video",    type: "video_text",  endpoint: "/api/v4/flower/video/from-text" },
-  "flow_vt":     { label: "⚡ Flow Video",      type: "video_text",  endpoint: "/api/v4/flow/video/from-text" },
-  "grok_vt":     { label: "🤖 Grok Video",      type: "video_text",  endpoint: "/api/v4/grok/video/from-text" },
-  "flower_vi":   { label: "🌸 Flower Vid+Фото", type: "video_image", endpoint: "/api/v4/flower/video/from-image" },
-  "flow_vi":     { label: "⚡ Flow Vid+Фото",   type: "video_image", endpoint: "/api/v4/flow/video/from-image" },
-  "grok_vi":     { label: "🤖 Grok Vid+Фото",   type: "video_image", endpoint: "/api/v4/grok/video/from-image" },
+// ─── Все модели с сайта ───────────────────
+const IMAGE_MODELS = {
+  "imagen4_flow":    { label: "🖼 Imagen 4 - Flow",         endpoint: "/api/v4/flow/image/generate",    ratio: true },
+  "nanobpro_flow":   { label: "🍌 Nano Banana Pro - Flow",  endpoint: "/api/v4/flow/image/generate",    ratio: true, model: "nano-banana-pro" },
+  "nanob2_flow":     { label: "🍌 Nano Banana 2 - Flow",    endpoint: "/api/v4/flow/image/generate",    ratio: true, model: "nano-banana-2" },
+  "grok_img":        { label: "🤖 Grok",                    endpoint: "/api/v4/grok/image/generate",    ratio: true },
+  "nanob2_flower":   { label: "🌸 Nano Banana 2 - Flower",  endpoint: "/api/v4/flower/image/generate",  ratio: true },
+  "chatgpt_img":     { label: "🧠 ChatGPT Images 2.0",      endpoint: "/api/v4/openai/image/generate",  ratio: true },
 };
 
-const RESOLUTIONS = ["512x512", "768x768", "1024x1024", "1280x720", "1920x1080", "1024x1536", "1536x1024"];
+const VIDEO_MODELS = {
+  "veo31_fast":      { label: "⚡ Veo 3.1 Fast",            endpoint: "/api/v4/flow/video/from-text",   submodel: "veo-3.1-fast",    fromImage: "/api/v4/flow/video/from-image" },
+  "veo31_light":     { label: "💡 Veo 3.1 Light",           endpoint: "/api/v4/flow/video/from-text",   submodel: "veo-3.1-light",   fromImage: "/api/v4/flow/video/from-image" },
+  "veo31_quality":   { label: "✨ Veo 3.1 Quality (10x)",   endpoint: "/api/v4/flow/video/from-text",   submodel: "veo-3.1-quality", fromImage: "/api/v4/flow/video/from-image" },
+  "grok_vid":        { label: "🤖 Grok Video",              endpoint: "/api/v4/grok/video/from-text",   fromImage: "/api/v4/grok/video/from-image",   res: true },
+  "veo31_flower":    { label: "🌸 Veo 3.1 Flower",          endpoint: "/api/v4/flower/video/from-text", fromImage: "/api/v4/flower/video/from-image" },
+};
+
+const RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"];
 const COUNTS = [1, 2, 3, 4, 5, 6, 8, 10];
 
 function getState(chatId) {
   if (!userState[chatId]) {
-    userState[chatId] = { step: null, model: "flower_vi", resolution: "1024x1024", count: 1, fileId: null };
+    userState[chatId] = {
+      step: null,
+      mode: "image",           // image | video_text | video_image
+      imageModel: "imagen4_flow",
+      videoModel: "veo31_fast",
+      ratio: "16:9",
+      resolution: "720p",
+      count: 1,
+      seed: "random",
+      fileId: null,
+    };
   }
   return userState[chatId];
 }
 
-// Извлечь медиа из ответа API (поддерживает base64 и URL)
+// ─── Извлечь медиа из ответа API ──────────
 function extractMedia(data) {
-  // result — массив base64 строк
   if (Array.isArray(data.result) && data.result.length > 0) {
     return { base64: data.result[0], type: data.media_type || "video" };
   }
-  if (typeof data.result === "string") {
+  if (typeof data.result === "string" && data.result.startsWith("data:")) {
     return { base64: data.result, type: data.media_type || "video" };
   }
-  // Обычные URL-поля
-  const url = data.video_url || data.image_url || data.url || data.output ||
-              data.result?.url || data.data?.url;
+  const url = data.video_url || data.image_url || data.url || data.output || data.result?.url;
   if (url) return { url, type: data.media_type || "video" };
   return null;
 }
 
-// Отправить base64 как файл в Telegram
+// ─── Отправить base64 файл ────────────────
 async function sendBase64Media(chatId, base64str, mediaType, caption) {
-  // base64str может быть "data:video/mp4;base64,AAAA..." или просто "AAAA..."
   let b64 = base64str;
   let ext = mediaType === "image" ? "jpg" : "mp4";
-
   if (base64str.includes(";base64,")) {
     const parts = base64str.split(";base64,");
     b64 = parts[1];
     const mime = parts[0].replace("data:", "");
     if (mime.includes("png")) ext = "png";
-    else if (mime.includes("gif")) ext = "gif";
     else if (mime.includes("webp")) ext = "webp";
+    else if (mime.includes("gif")) ext = "gif";
   }
-
-  const tmpPath = `/tmp/fastgen_${Date.now()}.${ext}`;
+  const tmpPath = `/tmp/fg_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
   fs.writeFileSync(tmpPath, Buffer.from(b64, "base64"));
-
   try {
-    if (mediaType === "image" || ext === "jpg" || ext === "png" || ext === "webp") {
+    if (["jpg","png","webp"].includes(ext)) {
       await bot.sendPhoto(chatId, fs.createReadStream(tmpPath), { caption, parse_mode: "Markdown" });
     } else {
       await bot.sendVideo(chatId, fs.createReadStream(tmpPath), { caption, parse_mode: "Markdown" });
     }
   } finally {
-    fs.unlinkSync(tmpPath);
+    try { fs.unlinkSync(tmpPath); } catch {}
   }
 }
 
@@ -82,49 +89,26 @@ async function sendBase64Media(chatId, base64str, mediaType, caption) {
 bot.onText(/\/start/, (msg) => { userState[msg.chat.id] = null; showMainMenu(msg.chat.id); });
 bot.onText(/\/menu/, (msg) => showMainMenu(msg.chat.id));
 
-// ─── /check <id> ──────────────────────────
-bot.onText(/\/check (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const opId = match[1].trim();
-  const statusMsg = await bot.sendMessage(chatId, `🔍 Проверяю \`${opId}\`...`, { parse_mode: "Markdown" });
-
-  try {
-    const { data } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
-      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
-    });
-
-    const status = data.status || data.state;
-    await bot.editMessageText(`Статус: *${status}*`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" });
-
-    if (["completed", "success", "done", "finished"].includes(status)) {
-      const media = extractMedia(data);
-      if (media) {
-        if (media.base64) {
-          await sendBase64Media(chatId, media.base64, media.type, "✅ Результат");
-        } else {
-          await bot.sendMessage(chatId, `🔗 ${media.url}`);
-        }
-      }
-    }
-  } catch (e) {
-    await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
-  }
-});
-
 // ─── Главное меню ─────────────────────────
 function showMainMenu(chatId) {
-  const state = getState(chatId);
-  const m = MODELS[state.model];
+  const s = getState(chatId);
+  const imgM = IMAGE_MODELS[s.imageModel];
+  const vidM = VIDEO_MODELS[s.videoModel];
   bot.sendMessage(chatId,
-    `🤖 *FastGen Bot*\n\nМодель: *${m.label}*\nРазрешение: *${state.resolution}*\nКоличество: *${state.count}*\n\nВыбери действие:`,
+    `🤖 *FastGen Bot*\n\n` +
+    `🖼 Изображение: *${imgM.label}*\n` +
+    `🎬 Видео: *${vidM.label}*\n` +
+    `📐 Соотношение: *${s.ratio}*  🔢 Кол-во: *${s.count}*\n\n` +
+    `Выбери что создать:`,
     {
       parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [
           [{ text: "🖼️ Изображение из текста", callback_data: "do_image" }],
-          [{ text: "📝 Видео из текста", callback_data: "do_video_text" }, { text: "🎬 Видео из фото", callback_data: "do_video_image" }],
-          [{ text: "⚙️ Модель", callback_data: "open_model" }, { text: "📐 Разрешение", callback_data: "open_resolution" }],
-          [{ text: "🔢 Количество", callback_data: "open_count" }],
+          [{ text: "📝 Видео из текста", callback_data: "do_vtext" }, { text: "🎬 Видео из фото", callback_data: "do_vimage" }],
+          [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
+          [{ text: "📐 Соотношение сторон", callback_data: "open_ratio" }],
+          [{ text: "🔢 Количество", callback_data: "open_count" }, { text: "🌱 Seed", callback_data: "open_seed" }],
         ],
       },
     }
@@ -136,134 +120,174 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const msgId = query.message.message_id;
   const data = query.data;
-  const state = getState(chatId);
+  const s = getState(chatId);
   bot.answerCallbackQuery(query.id);
 
-  if (data === "back_menu") { bot.deleteMessage(chatId, msgId).catch(() => {}); return showMainMenu(chatId); }
+  const del = () => bot.deleteMessage(chatId, msgId).catch(() => {});
+  const edit = (text, kb) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb });
+  const cancelBtn = { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] };
+
+  if (data === "back_menu") { del(); return showMainMenu(chatId); }
   if (data === "noop") return;
 
+  // ── Режимы
   if (data === "do_image") {
-    if (MODELS[state.model].type !== "image") state.model = "flower_img";
-    state.step = "waiting_prompt";
-    return bot.editMessageText("🖼️ *Изображение*\n\nНапиши промпт:", {
-      chat_id: chatId, message_id: msgId, parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-    });
+    s.step = "waiting_prompt"; s.mode = "image";
+    return edit("🖼️ *Изображение из текста*\n\nНапиши промпт:", cancelBtn);
   }
-  if (data === "do_video_text") {
-    if (MODELS[state.model].type !== "video_text") state.model = "flower_vt";
-    state.step = "waiting_prompt";
-    return bot.editMessageText("📝 *Видео из текста*\n\nОпиши видео:", {
-      chat_id: chatId, message_id: msgId, parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-    });
+  if (data === "do_vtext") {
+    s.step = "waiting_prompt"; s.mode = "video_text";
+    return edit("📝 *Видео из текста*\n\nОпиши видео:", cancelBtn);
   }
-  if (data === "do_video_image") {
-    if (MODELS[state.model].type !== "video_image") state.model = "flower_vi";
-    state.step = "waiting_photo";
-    return bot.editMessageText("🎬 *Видео из фото*\n\nОтправь фото:", {
-      chat_id: chatId, message_id: msgId, parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-    });
+  if (data === "do_vimage") {
+    s.step = "waiting_photo"; s.mode = "video_image";
+    return edit("🎬 *Видео из фото*\n\nОтправь фото:", cancelBtn);
   }
 
-  if (data === "open_model") {
-    const groups = [
-      { label: "── Изображения ──", keys: ["flower_img", "flow_img", "grok_img", "openai_img"] },
-      { label: "── Видео из текста ──", keys: ["flower_vt", "flow_vt", "grok_vt"] },
-      { label: "── Видео из фото ──", keys: ["flower_vi", "flow_vi", "grok_vi"] },
-    ];
+  // ── Модель изображения
+  if (data === "open_imgmodel") {
+    const rows = Object.entries(IMAGE_MODELS).map(([k, v]) => [{
+      text: s.imageModel === k ? `✅ ${v.label}` : v.label,
+      callback_data: `set_imgm_${k}`
+    }]);
+    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+    return edit("🎨 *Модель изображения:*", { inline_keyboard: rows });
+  }
+  if (data.startsWith("set_imgm_")) { s.imageModel = data.replace("set_imgm_", ""); del(); return showMainMenu(chatId); }
+
+  // ── Модель видео
+  if (data === "open_vidmodel") {
+    const rows = Object.entries(VIDEO_MODELS).map(([k, v]) => [{
+      text: s.videoModel === k ? `✅ ${v.label}` : v.label,
+      callback_data: `set_vidm_${k}`
+    }]);
+    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+    return edit("🎥 *Модель видео:*", { inline_keyboard: rows });
+  }
+  if (data.startsWith("set_vidm_")) { s.videoModel = data.replace("set_vidm_", ""); del(); return showMainMenu(chatId); }
+
+  // ── Соотношение сторон
+  if (data === "open_ratio") {
     const rows = [];
-    for (const g of groups) {
-      rows.push([{ text: g.label, callback_data: "noop" }]);
-      const btns = g.keys.map(k => ({ text: state.model === k ? `✅ ${MODELS[k].label}` : MODELS[k].label, callback_data: `set_model_${k}` }));
-      for (let i = 0; i < btns.length; i += 2) rows.push(btns.slice(i, i + 2));
+    for (let i = 0; i < RATIOS.length; i += 3) {
+      rows.push(RATIOS.slice(i, i + 3).map(r => ({
+        text: s.ratio === r ? `✅ ${r}` : r, callback_data: `set_ratio_${r.replace(":", "x")}`
+      })));
     }
     rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
-    return bot.editMessageText("🎨 Выбери модель:", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: rows } });
+    return edit("📐 *Соотношение сторон:*", { inline_keyboard: rows });
   }
-  if (data.startsWith("set_model_")) { state.model = data.replace("set_model_", ""); bot.deleteMessage(chatId, msgId).catch(() => {}); return showMainMenu(chatId); }
+  if (data.startsWith("set_ratio_")) { s.ratio = data.replace("set_ratio_", "").replace("x", ":"); del(); return showMainMenu(chatId); }
 
-  if (data === "open_resolution") {
-    const rows = [];
-    for (let i = 0; i < RESOLUTIONS.length; i += 2) {
-      rows.push(RESOLUTIONS.slice(i, i + 2).map(r => ({ text: state.resolution === r ? `✅ ${r}` : r, callback_data: `set_res_${r}` })));
-    }
-    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
-    return bot.editMessageText("📐 Разрешение:", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: rows } });
-  }
-  if (data.startsWith("set_res_")) { state.resolution = data.replace("set_res_", ""); bot.deleteMessage(chatId, msgId).catch(() => {}); return showMainMenu(chatId); }
-
+  // ── Количество
   if (data === "open_count") {
     const rows = [];
     for (let i = 0; i < COUNTS.length; i += 4) {
-      rows.push(COUNTS.slice(i, i + 4).map(c => ({ text: state.count === c ? `✅ ${c}` : `${c}`, callback_data: `set_count_${c}` })));
+      rows.push(COUNTS.slice(i, i + 4).map(c => ({
+        text: s.count === c ? `✅ ${c}` : `${c}`, callback_data: `set_count_${c}`
+      })));
     }
     rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
-    return bot.editMessageText("🔢 Количество:", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: rows } });
+    return edit("🔢 *Количество за раз:*", { inline_keyboard: rows });
   }
-  if (data.startsWith("set_count_")) { state.count = parseInt(data.replace("set_count_", "")); bot.deleteMessage(chatId, msgId).catch(() => {}); return showMainMenu(chatId); }
+  if (data.startsWith("set_count_")) { s.count = parseInt(data.replace("set_count_", "")); del(); return showMainMenu(chatId); }
+
+  // ── Seed
+  if (data === "open_seed") {
+    return edit("🌱 *Seed:*", {
+      inline_keyboard: [
+        [
+          { text: s.seed === "random" ? "✅ Случайный" : "Случайный", callback_data: "set_seed_random" },
+          { text: s.seed === "fixed" ? "✅ Фиксированный" : "Фиксированный", callback_data: "set_seed_fixed" },
+        ],
+        [{ text: "◀️ Назад", callback_data: "back_menu" }],
+      ]
+    });
+  }
+  if (data === "set_seed_random") { s.seed = "random"; del(); return showMainMenu(chatId); }
+  if (data === "set_seed_fixed") { s.seed = "fixed"; del(); return showMainMenu(chatId); }
 });
 
 // ─── Фото ─────────────────────────────────
 bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
-  const state = getState(chatId);
-  state.fileId = msg.photo[msg.photo.length - 1].file_id;
-  if (state.step === "waiting_photo") {
-    state.step = "waiting_prompt";
-    bot.sendMessage(chatId, "✅ Фото получено!\n\nНапиши описание:", {
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-    });
-  } else {
-    state.model = "flower_vi";
-    state.step = "waiting_prompt";
-    bot.sendMessage(chatId, "✅ Фото получено!\n\nНапиши описание:", {
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-    });
-  }
+  const s = getState(chatId);
+  s.fileId = msg.photo[msg.photo.length - 1].file_id;
+  s.mode = "video_image";
+  s.step = "waiting_prompt";
+  bot.sendMessage(chatId, "✅ Фото получено!\n\nТеперь напиши описание движения:", {
+    reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+  });
 });
 
-// ─── Текст/промпт ────────────────────────
+// ─── Промпт ───────────────────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const state = getState(chatId);
+  const s = getState(chatId);
   if (!msg.text || msg.text.startsWith("/")) return;
-  if (state.step !== "waiting_prompt") return bot.sendMessage(chatId, "Нажми /menu чтобы начать.");
+  if (s.step !== "waiting_prompt") return bot.sendMessage(chatId, "Нажми /menu чтобы начать.");
 
   const prompt = msg.text;
-  state.step = null;
-  const modelInfo = MODELS[state.model];
-  const count = state.count;
+  s.step = null;
+  const count = s.count;
+
+  // Определяем модель и эндпоинт
+  let modelInfo, endpoint, isImage;
+  if (s.mode === "image") {
+    modelInfo = IMAGE_MODELS[s.imageModel];
+    endpoint = modelInfo.endpoint;
+    isImage = true;
+  } else if (s.mode === "video_text") {
+    modelInfo = VIDEO_MODELS[s.videoModel];
+    endpoint = modelInfo.endpoint;
+    isImage = false;
+  } else {
+    modelInfo = VIDEO_MODELS[s.videoModel];
+    endpoint = modelInfo.fromImage;
+    isImage = false;
+  }
 
   const statusMsg = await bot.sendMessage(chatId,
-    `⏳ Запускаю ${count} задач...\n🎨 ${modelInfo.label}\n📐 ${state.resolution}`
+    `⏳ Запускаю ${count} задач...\n${modelInfo.label}\n📐 ${s.ratio}`
   );
 
-  const tasks = Array.from({ length: count }, (_, i) => generateOne(chatId, state, prompt, modelInfo, i + 1, count));
-  await bot.editMessageText(`⏳ ${count} задач запущено. Жди...`, { chat_id: chatId, message_id: statusMsg.message_id });
+  const tasks = Array.from({ length: count }, (_, i) =>
+    generateOne(chatId, s, prompt, endpoint, modelInfo, isImage, i + 1, count)
+  );
+  await bot.editMessageText(`⏳ ${count} задач запущено. Ожидай...`, { chat_id: chatId, message_id: statusMsg.message_id });
 
   const results = await Promise.allSettled(tasks);
   const ok = results.filter(r => r.status === "fulfilled").length;
   const fail = count - ok;
-  await bot.editMessageText(`✅ Готово! Успешно: ${ok}${fail > 0 ? ` | ❌ Ошибок: ${fail}` : ""}`,
-    { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
+  await bot.editMessageText(
+    `✅ Готово! Успешно: ${ok}${fail > 0 ? ` | ❌ Ошибок: ${fail}` : ""}`,
+    { chat_id: chatId, message_id: statusMsg.message_id }
+  ).catch(() => {});
 
   showMainMenu(chatId);
 });
 
-// ─── Генерация одной задачи ───────────────
-async function generateOne(chatId, state, prompt, modelInfo, index, total) {
+// ─── Генерация ────────────────────────────
+async function generateOne(chatId, s, prompt, endpoint, modelInfo, isImage, index, total) {
   const label = total > 1 ? ` (${index}/${total})` : "";
   try {
-    let body = { prompt, resolution: state.resolution };
-    if (modelInfo.type === "video_image") {
-      const f = await bot.getFile(state.fileId);
+    const body = {
+      prompt,
+      aspect_ratio: s.ratio,
+      ...(modelInfo.submodel && { model: modelInfo.submodel }),
+      ...(modelInfo.model && { model: modelInfo.model }),
+      ...(s.seed === "fixed" && { seed: 42 }),
+    };
+
+    if (s.mode === "video_image" && s.fileId) {
+      const f = await bot.getFile(s.fileId);
       const imgResp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
       body.image = `data:image/jpeg;base64,${Buffer.from(imgResp.data).toString("base64")}`;
     }
 
-    const { data } = await axios.post(`${BASE_URL}${modelInfo.endpoint}`, body, {
+    if (modelInfo.res) body.resolution = s.resolution || "720p";
+
+    const { data } = await axios.post(`${BASE_URL}${endpoint}`, body, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
       timeout: 60000,
     });
@@ -276,19 +300,15 @@ async function generateOne(chatId, state, prompt, modelInfo, index, total) {
 
     if (result) {
       if (result.base64) {
-        await sendBase64Media(chatId, result.base64, result.type, caption);
+        await sendBase64Media(chatId, result.base64, isImage ? "image" : "video", caption);
       } else if (result.url) {
-        if (result.type === "image") {
-          await bot.sendPhoto(chatId, result.url, { caption, parse_mode: "Markdown" });
-        } else {
-          await bot.sendVideo(chatId, result.url, { caption, parse_mode: "Markdown" });
-        }
+        if (isImage) await bot.sendPhoto(chatId, result.url, { caption, parse_mode: "Markdown" });
+        else await bot.sendVideo(chatId, result.url, { caption, parse_mode: "Markdown" });
       }
     } else {
-      await bot.sendMessage(chatId, `⏰ Задача${label} не успела.\nID: \`${opId}\`\nНапиши: /check ${opId}`, { parse_mode: "Markdown" });
+      await bot.sendMessage(chatId, `⏰ Задача${label} не успела.\nID: \`${opId}\`\n/check ${opId}`, { parse_mode: "Markdown" });
     }
   } catch (e) {
-    console.error(`[${index}] Ошибка:`, e.response?.data || e.message);
     const errMsg = e.response?.data?.detail || e.response?.data?.message || e.message;
     await bot.sendMessage(chatId, `❌ Задача${label}: ${errMsg}`);
     throw e;
@@ -305,16 +325,35 @@ async function pollResult(opId, maxAttempts = 36, interval = 10000) {
       });
       const status = data.status || data.state;
       console.log(`Poll[${i+1}] ${opId}: ${status}`);
-
-      if (["completed", "success", "done", "finished"].includes(status)) {
-        return extractMedia(data);
-      }
+      if (["completed", "success", "done", "finished"].includes(status)) return extractMedia(data);
       if (["failed", "error", "cancelled"].includes(status)) throw new Error(`Статус: ${status}`);
     } catch (e) {
-      console.log(`Poll err:`, e.message);
+      if (!e.message.includes("Статус")) console.log(`Poll err:`, e.message);
+      else throw e;
     }
   }
   return null;
 }
+
+// ─── /check <id> ──────────────────────────
+bot.onText(/\/check (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const opId = match[1].trim();
+  const statusMsg = await bot.sendMessage(chatId, `🔍 Проверяю \`${opId}\`...`, { parse_mode: "Markdown" });
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+    });
+    const status = data.status || data.state;
+    await bot.editMessageText(`Статус: *${status}*`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" });
+    if (["completed", "success", "done", "finished"].includes(status)) {
+      const media = extractMedia(data);
+      if (media?.base64) await sendBase64Media(chatId, media.base64, media.type, "✅ Результат");
+      else if (media?.url) await bot.sendMessage(chatId, media.url);
+    }
+  } catch (e) {
+    await bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+  }
+});
 
 console.log("🤖 Бот запущен!");
