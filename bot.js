@@ -6,8 +6,8 @@ const path = require("path");
 // ============================
 // НАСТРОЙКИ — вставьте свои ключи
 // ============================
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "8987016847:AAHecorr79d4HJDHJeUUqt2wiSf4UAlbCv8";
-const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY || "aV6RodiGKYflyV0aLo45yeRsAFAGC9ox";
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
+const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY
 const FASTGEN_BASE_URL = "https://googler.fast-gen.ai";
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
