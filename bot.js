@@ -123,7 +123,7 @@ const DEFAULT_STATE = () => ({
   batchPromptIdx: 0,
   keyframeStart: null, keyframeEnd: null,
   fileId: null,
-  pendingRefImages: [], // референсы для текущей генерации
+  pendingRefImages: [],
   balanceMsgId: null,
   menuMsgId: null,
   pgSplitMode: "lines",
@@ -267,7 +267,7 @@ async function showMainMenu(chatId) {
     `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
     `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`;
   const kb = { inline_keyboard: [
-    [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из референсов", callback_data: "do_image_ref" }],
+    [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "do_image_ref" }],
     [{ text: "🎬 Видео из текста", callback_data: "do_vtext" }, { text: "📸 Видео из фото", callback_data: "do_vimage" }],
     [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
     [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
@@ -598,11 +598,10 @@ bot.on("callback_query", async (query) => {
     });
   }
   if (data === "ref_photos_done") {
-    if (!s.pendingRefImages || s.pendingRefImages.length === 0) {
+    if (!s.pendingRefImages || s.pendingRefImages.length === 0)
       return bot.sendMessage(chatId, "❌ Сначала отправь хотя бы 1 фото!", { reply_markup: { inline_keyboard: [[{ text: "◀️ Назад", callback_data: "do_image_ref" }]] } });
-    }
     s.step = "waiting_prompt";
-    return bot.sendMessage(chatId, `✅ Референсов: ${s.pendingRefImages.length}\n\nТеперь напиши промпт для генерации:`, {
+    return bot.sendMessage(chatId, `✅ Референсов: ${s.pendingRefImages.length}\n\nТеперь напиши промпт:`, {
       reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
     });
   }
@@ -610,11 +609,9 @@ bot.on("callback_query", async (query) => {
   if (data === "do_vtext") { s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal"; return edit(`🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, cancelKb); }
 
   if (data === "do_vimage") {
-    // Определяем лимит рефов по модели видео
-    const vidRefModel = VIDEO_MODELS[s.vidModel];
-    const vidRefMax = vidRefModel && s.vidModel === "grok_vid" ? 7 : 3;
+    const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
     s.pendingRefImages = []; s.tab="video_ref"; s.mode="normal"; s.step="waiting_vid_ref_photos";
-    return edit(`📸 *Видео из фото*\n${vidRefModel.label}\n\nОтправь до ${vidRefMax} фото по одному:\n(Гrok — до 7, Veo — до 3)`, {
+    return edit(`📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:\n(Grok — до 7, Veo/остальные — до 3)`, {
       inline_keyboard: [
         [{ text: "✅ Фото готовы, ввести промпт", callback_data: "vid_ref_photos_done" }],
         [{ text: "❌ Отмена", callback_data: "back_menu" }],
@@ -622,9 +619,8 @@ bot.on("callback_query", async (query) => {
     });
   }
   if (data === "vid_ref_photos_done") {
-    if (!s.pendingRefImages || s.pendingRefImages.length === 0) {
+    if (!s.pendingRefImages || s.pendingRefImages.length === 0)
       return bot.sendMessage(chatId, "❌ Сначала отправь хотя бы 1 фото!", { reply_markup: { inline_keyboard: [[{ text: "◀️ Назад", callback_data: "do_vimage" }]] } });
-    }
     s.step = "waiting_prompt";
     return bot.sendMessage(chatId, `✅ Фото: ${s.pendingRefImages.length}\n\nТеперь напиши описание видео:`, {
       reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
@@ -777,14 +773,11 @@ bot.on("photo", async (msg) => {
   }
   if (s.step === "waiting_ref_photos") {
     if (!s.pendingRefImages) s.pendingRefImages = [];
-    if (s.pendingRefImages.length >= 10) {
-      return bot.sendMessage(chatId, "❌ Максимум 10 референсов! Нажми кнопку для продолжения.", {
-        reply_markup: { inline_keyboard: [[{ text: "✅ Готово, ввести промпт", callback_data: "ref_photos_done" }],[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-      });
-    }
+    if (s.pendingRefImages.length >= 10)
+      return bot.sendMessage(chatId, "❌ Максимум 10 референсов!", { reply_markup: { inline_keyboard: [[{ text: "✅ Готово, ввести промпт", callback_data: "ref_photos_done" }]] } });
     s.pendingRefImages.push(fileId);
     const cnt = s.pendingRefImages.length;
-    return bot.sendMessage(chatId, `✅ Референс ${cnt}/10 добавлен! Можешь отправить ещё или нажми кнопку:`, {
+    return bot.sendMessage(chatId, `✅ Референс ${cnt}/10 добавлен!`, {
       reply_markup: { inline_keyboard: [
         [{ text: `✅ Готово (${cnt} фото), ввести промпт`, callback_data: "ref_photos_done" }],
         [{ text: "❌ Отмена", callback_data: "back_menu" }],
@@ -793,18 +786,14 @@ bot.on("photo", async (msg) => {
   }
   if (s.step === "waiting_vid_ref_photos") {
     if (!s.pendingRefImages) s.pendingRefImages = [];
-    const vidM = VIDEO_MODELS[s.vidModel];
     const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
-    if (s.pendingRefImages.length >= maxVidRef) {
-      return bot.sendMessage(chatId, `❌ Максимум ${maxVidRef} фото для ${vidM.label}! Нажми кнопку:`, {
-        reply_markup: { inline_keyboard: [[{ text: "✅ Готово, ввести промпт", callback_data: "vid_ref_photos_done" }],[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-      });
-    }
+    if (s.pendingRefImages.length >= maxVidRef)
+      return bot.sendMessage(chatId, `❌ Максимум ${maxVidRef} фото!`, { reply_markup: { inline_keyboard: [[{ text: "✅ Готово, ввести промпт", callback_data: "vid_ref_photos_done" }]] } });
     s.pendingRefImages.push(fileId);
-    const cnt = s.pendingRefImages.length;
-    return bot.sendMessage(chatId, `✅ Фото ${cnt}/${maxVidRef} добавлено! Можешь отправить ещё или нажми кнопку:`, {
+    const cnt2 = s.pendingRefImages.length;
+    return bot.sendMessage(chatId, `✅ Фото ${cnt2}/${maxVidRef} добавлено!`, {
       reply_markup: { inline_keyboard: [
-        [{ text: `✅ Готово (${cnt} фото), ввести промпт`, callback_data: "vid_ref_photos_done" }],
+        [{ text: `✅ Готово (${cnt2} фото), ввести промпт`, callback_data: "vid_ref_photos_done" }],
         [{ text: "❌ Отмена", callback_data: "back_menu" }],
       ]}
     });
@@ -925,8 +914,7 @@ bot.on("message", async (msg) => {
 async function runNormal(chatId, s, prompt) {
   const isImage = s.tab === "image" || s.tab === "image_ref";
   let model, endpoint;
-  if (s.tab === "image") { model = IMAGE_MODELS[s.imgModel]; endpoint = model.ep; }
-  else if (s.tab === "image_ref") { model = IMAGE_MODELS[s.imgModel]; endpoint = model.ep; }
+  if (s.tab === "image" || s.tab === "image_ref") { model = IMAGE_MODELS[s.imgModel]; endpoint = model.ep; }
   else if (s.tab === "video_text") { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epT; }
   else if (s.tab === "video_ref") { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
   else { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
@@ -1033,7 +1021,7 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
       const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
     }
-    // Референсные изображения (для image_ref и video_ref)
+    // Референсные изображения
     const pendingRefs = s.pendingRefImages || [];
     if (pendingRefs.length > 0 && (s.tab === "image_ref" || s.tab === "video_ref")) {
       const refImages = [];
@@ -1042,18 +1030,21 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
           const rf = await bot.getFile(rid);
           const rr = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${rf.file_path}`, { responseType:"arraybuffer" });
           refImages.push(`data:image/jpeg;base64,${Buffer.from(rr.data).toString("base64")}`);
-        } catch(e) { /* пропускаем недоступное фото */ }
+        } catch(e) { console.log("[ref] skip failed ref:", e.message); }
       }
       if (refImages.length > 0) {
         if (s.tab === "image_ref") body.reference_images = refImages;
-        else body.images = refImages; // для video from-ingredients/from-image
+        else if (s.tab === "video_ref") body.images = refImages;
+        console.log(`[refs] sending ${refImages.length} refs, tab=${s.tab}, field=${s.tab==="image_ref"?"reference_images":"images"}`);
       }
     }
 
+    console.log(`[genOne] endpoint=${endpoint} tab=${s.tab} bodyKeys=${Object.keys(body).join(",")}`);
     const { data } = await axios.post(`${BASE_URL}${endpoint}`, body, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
       timeout: 60000,
     });
+    console.log(`[genOne] response keys=${Object.keys(data).join(",")}`);
 
     const opId = data.operation_id || data.task_id || data.id;
     if (!opId) throw new Error("Нет ID задачи");
@@ -1083,7 +1074,7 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     const errDetail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error;
     const errStatus = e.response?.status ? `[${e.response.status}] ` : "";
     const errStr = errDetail ? (typeof errDetail === "object" ? JSON.stringify(errDetail) : String(errDetail)) : e.message;
-    console.log(`[genOne error] status=${e.response?.status} endpoint=${endpoint} body=${JSON.stringify(e.response?.data).slice(0,300)}`);
+    console.log(`[genOne error] status=${e.response?.status} endpoint=${endpoint} errData=${JSON.stringify(e.response?.data).slice(0,500)} bodyKeys=${Object.keys(body).join(",")}`);
     await bot.sendMessage(chatId, `❌ ${errStatus}${label?`[${label}] `:""}${errStr}`, {
       reply_markup: { inline_keyboard: [[{ text:"🔄 Повторить", callback_data:`show_regen_0` }]] }
     });
