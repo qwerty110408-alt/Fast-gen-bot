@@ -311,7 +311,11 @@ async function pollResult(opId, max=90, interval=10000) {
         console.log(`[poll] FAILED opId=${opId} reason=${reason}`);
         throw new Error(`Статус: ${st}${reason !== st ? ` — ${reason}` : ""}`);
       }
-    } catch(e) { if (e.message.startsWith("Статус")) throw e; }
+    } catch(e) {
+      if (e.message && e.message.startsWith("Статус")) throw e;
+      // network error — log and retry next iteration
+      console.log(`[poll] retry after error: ${e.message}`);
+    }
   }
   return null;
 }
@@ -492,18 +496,18 @@ function showBatchMenu(chatId, msgId = null) {
   const prompts = s.batchPrompts;
   const photos = s.batchPhotos;
   const idx = s.batchPromptIdx || 0;
-  const bt = s.batchType || "image";
-  const isImage = bt === "image";
+  const { bt, isImage, model, ratio, resolution, vidModelKey } = batchEffective(s);
   const isVideoImage = bt === "video_image";
+  const isGrokVid = vidModelKey === "grok_vid";
   const MAX_PROMPTS = isImage ? 500 : 200;
   const currentPrompt = prompts.length > 0 ? prompts[idx] : null;
 
-  const modelLabel = isImage
-    ? IMAGE_MODELS[s.imgModel].label
-    : VIDEO_MODELS[s.vidModel].label;
-
   const typeIcon = isImage ? "🖼" : isVideoImage ? "📸" : "🎬";
   const typeLabel = isImage ? "Фото из текста" : isVideoImage ? "Видео из фото+текста" : "Видео из текста";
+
+  const ownModel = isImage ? s.batchImgModel != null : s.batchVidModel != null;
+  const ownRatio = s.batchRatio != null;
+  const ownRes   = s.batchResolution != null;
 
   let totalTasks = 0;
   if (isVideoImage) totalTasks = photos.length * s.perPrompt + prompts.length * s.perPrompt;
@@ -512,7 +516,9 @@ function showBatchMenu(chatId, msgId = null) {
   const text =
     `📦 *Пакетный режим*\n\n` +
     `${typeIcon} Тип: *${typeLabel}*\n` +
-    `🤖 Модель: *${modelLabel}*\n` +
+    `🤖 Модель: *${model.label}*${ownModel ? " ✏️" : ""}\n` +
+    `📐 Соотношение: *${ratio}*${ownRatio ? " ✏️" : ""}\n` +
+    (!isImage && isGrokVid ? `🖥 Разрешение: *${resolution}*${ownRes ? " ✏️" : ""}\n` : "") +
     `📝 Промптов: *${prompts.length}/${MAX_PROMPTS}*\n` +
     (isVideoImage ? `📸 Фото: *${photos.length}*\n` : "") +
     `🔢 На 1 промпт/фото: *${s.perPrompt}* вар.\n` +
@@ -527,7 +533,7 @@ function showBatchMenu(chatId, msgId = null) {
   ] : [];
 
   const kb = { inline_keyboard: [
-    [{ text: `${typeIcon} Сменить тип`, callback_data: "batch_change_type" }],
+    [{ text: `${typeIcon} Сменить тип`, callback_data: "batch_change_type" }, { text: "⚙️ Настройки пакета", callback_data: "batch_settings" }],
     ...(navRow.length ? [navRow] : []),
     [{ text: "✏️ Добавить промпты", callback_data: "batch_add_text" }, { text: "📄 Из файла .txt", callback_data: "batch_from_file" }],
     ...(isVideoImage ? [[{ text: "📸 Фото управление", callback_data: "batch_photos_menu" }]] : []),
@@ -1397,7 +1403,7 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
       ...(s.seed === "fixed" && { seed: 42 }),
     };
     const fid = overrideFileId || s.fileId;
-    if (fid && (s.tab==="video_image" || overrideFileId)) {
+    if (fid) {
       const f = await bot.getFile(fid);
       const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
@@ -1423,7 +1429,7 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     console.log(`[genOne] endpoint=${endpoint} tab=${s.tab} bodyKeys=${Object.keys(body).join(",")}`);
     const { data } = await axios.post(`${BASE_URL}${endpoint}`, body, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
-      timeout: 60000,
+      timeout: 120000,
     });
     console.log(`[genOne] response keys=${Object.keys(data).join(",")}`);
 
