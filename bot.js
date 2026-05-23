@@ -203,6 +203,7 @@ const DEFAULT_STATE = () => ({
   seed: "random", resolution: "720p", mode: "normal",
   batchPrompts: [], batchPhotos: [],
   batchPromptIdx: 0,
+  batchType: "image", // "image" | "video_text" | "video_image"
   keyframeStart: null, keyframeEnd: null,
   fileId: null,
   pendingRefImages: [],
@@ -240,7 +241,7 @@ function saveState(chatId) {
   persistedStates[key] = {
     tab: s.tab, imgModel: s.imgModel, vidModel: s.vidModel,
     ratio: s.ratio, count: s.count, perPrompt: s.perPrompt,
-    seed: s.seed, resolution: s.resolution,
+    seed: s.seed, resolution: s.resolution, batchType: s.batchType,
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
   };
@@ -379,22 +380,67 @@ async function showMainMenu(chatId) {
   s.menuMsgId = m.message_id;
 }
 
+// ─── Выбор типа пакетного режима ─────────
+function showBatchTypeMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const bt = s.batchType || "image";
+  const im = IMAGE_MODELS[s.imgModel];
+  const vm = VIDEO_MODELS[s.vidModel];
+
+  const typeLabels = {
+    "image":       `🖼 Фото из текста (${im.label})`,
+    "video_text":  `🎬 Видео из текста (${vm.label})`,
+    "video_image": `📸 Видео из фото+текста (${vm.label})`,
+  };
+
+  const text =
+    `📦 *Пакетный режим — выбор типа*\n\n` +
+    `Текущий тип: *${typeLabels[bt]}*\n\n` +
+    `Выбери что генерировать:`;
+
+  const kb = { inline_keyboard: [
+    [{ text: bt==="image"      ? `✅ 🖼 Фото из текста`        : `🖼 Фото из текста`,        callback_data: "batch_type_image" }],
+    [{ text: bt==="video_text" ? `✅ 🎬 Видео из текста`       : `🎬 Видео из текста`,       callback_data: "batch_type_video_text" }],
+    [{ text: bt==="video_image"? `✅ 📸 Видео из фото+текста`  : `📸 Видео из фото+текста`,  callback_data: "batch_type_video_image" }],
+    [{ text: "▶️ Продолжить →", callback_data: "do_batch_menu" }],
+    [{ text: "❌ Отмена", callback_data: "back_menu" }],
+  ]};
+
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
 // ─── Пакетное меню ────────────────────────
 function showBatchMenu(chatId, msgId = null) {
   const s = getState(chatId);
   const prompts = s.batchPrompts;
   const photos = s.batchPhotos;
   const idx = s.batchPromptIdx || 0;
-  const isImage = s.tab === "image";
+  const bt = s.batchType || "image";
+  const isImage = bt === "image";
+  const isVideoImage = bt === "video_image";
   const MAX_PROMPTS = isImage ? 500 : 15;
   const currentPrompt = prompts.length > 0 ? prompts[idx] : null;
 
+  const modelLabel = isImage
+    ? IMAGE_MODELS[s.imgModel].label
+    : VIDEO_MODELS[s.vidModel].label;
+
+  const typeIcon = isImage ? "🖼" : isVideoImage ? "📸" : "🎬";
+  const typeLabel = isImage ? "Фото из текста" : isVideoImage ? "Видео из фото+текста" : "Видео из текста";
+
+  let totalTasks = 0;
+  if (isVideoImage) totalTasks = photos.length * s.perPrompt + prompts.length * s.perPrompt;
+  else totalTasks = prompts.length * s.perPrompt;
+
   const text =
     `📦 *Пакетный режим*\n\n` +
+    `${typeIcon} Тип: *${typeLabel}*\n` +
+    `🤖 Модель: *${modelLabel}*\n` +
     `📝 Промптов: *${prompts.length}/${MAX_PROMPTS}*\n` +
-    `📸 Фото: *${photos.length}*\n` +
+    (isVideoImage ? `📸 Фото: *${photos.length}*\n` : "") +
     `🔢 На 1 промпт/фото: *${s.perPrompt}* вар.\n` +
-    `Всего задач: *${(prompts.length + photos.length) * s.perPrompt}*\n\n` +
+    `Всего задач: *${totalTasks}*\n\n` +
     (currentPrompt ? `*Промпт ${idx+1}/${prompts.length}:*\n${currentPrompt}` : "_Промптов нет_");
 
   const navRow = prompts.length > 0 ? [
@@ -405,9 +451,10 @@ function showBatchMenu(chatId, msgId = null) {
   ] : [];
 
   const kb = { inline_keyboard: [
+    [{ text: `${typeIcon} Сменить тип`, callback_data: "batch_change_type" }],
     ...(navRow.length ? [navRow] : []),
     [{ text: "✏️ Добавить промпты", callback_data: "batch_add_text" }, { text: "📄 Из файла .txt", callback_data: "batch_from_file" }],
-    [{ text: "📸 Фото управление", callback_data: "batch_photos_menu" }],
+    ...(isVideoImage ? [[{ text: "📸 Фото управление", callback_data: "batch_photos_menu" }]] : []),
     [{ text: `🔢 На 1 промпт: ${s.perPrompt}`, callback_data: "batch_per_prompt" }],
     [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
     [{ text: "🗑 Очистить всё", callback_data: "batch_clear" }, { text: "❌ Отмена", callback_data: "back_menu" }],
@@ -422,7 +469,7 @@ function showBatchPhotosMenu(chatId, msgId) {
   const photos = s.batchPhotos;
   const text = `📸 *Фото в пакете: ${photos.length}*\n\nДобавь фото отправив их в чат.\nДля удаления нажми кнопку:`;
   const rows = photos.map((_, i) => [{ text: `🗑 Удалить фото ${i+1}`, callback_data: `del_photo_${i}` }]);
-  rows.push([{ text: "◀️ Назад", callback_data: "do_batch" }]);
+  rows.push([{ text: "◀️ Назад", callback_data: "do_batch_menu" }]);
   bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } }).catch(()=>{});
 }
 
@@ -566,7 +613,8 @@ async function runPromptGen(chatId, storyText) {
     return showMainMenu(chatId);
   }
 
-  const MAX = s.tab === "image" ? 500 : 15;
+  const bt = s.batchType || "image";
+  const MAX = bt === "image" ? 500 : 15;
   const available = MAX - s.batchPrompts.length;
   const toAdd = results.slice(0, available);
   s.batchPrompts.push(...toAdd);
@@ -740,7 +788,12 @@ bot.on("callback_query", async (query) => {
   if (data === "kf_skip_end") { s.step="waiting_prompt"; return edit("✅ Только начальный кадр.\n\nНапиши описание:", cancelKb); }
 
   // ── Пакетный режим
-  if (data === "do_batch") { s.mode="batch"; return showBatchMenu(chatId, msgId); }
+  if (data === "do_batch") { s.mode="batch"; return showBatchTypeMenu(chatId, msgId); }
+  if (data === "do_batch_menu") { s.mode="batch"; return showBatchMenu(chatId, msgId); }
+  if (data === "batch_change_type") { return showBatchTypeMenu(chatId, msgId); }
+  if (data === "batch_type_image")       { s.batchType="image";       s.tab="image";      saveState(chatId); return showBatchTypeMenu(chatId, msgId); }
+  if (data === "batch_type_video_text")  { s.batchType="video_text";  s.tab="video_text"; saveState(chatId); return showBatchTypeMenu(chatId, msgId); }
+  if (data === "batch_type_video_image") { s.batchType="video_image"; s.tab="video_image";saveState(chatId); return showBatchTypeMenu(chatId, msgId); }
   if (data === "batch_add_text") { s.step="waiting_batch_prompts"; return edit("✏️ Напиши промпты, каждый с новой строки:", cancelKb); }
   if (data === "batch_from_file") { s.step="waiting_txt_file"; return edit("📄 Отправь .txt файл с промптами (каждый с новой строки):", cancelKb); }
   if (data === "batch_photos_menu") return showBatchPhotosMenu(chatId, msgId);
@@ -861,10 +914,17 @@ bot.on("photo", async (msg) => {
   const fileId = msg.photo[msg.photo.length-1].file_id;
 
   if (s.mode === "batch") {
-    s.batchPhotos.push(fileId);
-    return bot.sendMessage(chatId, `✅ Фото добавлено! Всего: ${s.batchPhotos.length} фото, ${s.batchPrompts.length} промптов`, {
-      reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch" }],[{ text:"🚀 Генерировать!", callback_data:"batch_run" }]] }
-    });
+    const bt = s.batchType || "image";
+    if (bt === "video_image") {
+      s.batchPhotos.push(fileId);
+      return bot.sendMessage(chatId, `✅ Фото добавлено! Всего: ${s.batchPhotos.length} фото, ${s.batchPrompts.length} промптов`, {
+        reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch_menu" }],[{ text:"🚀 Генерировать!", callback_data:"batch_run" }]] }
+      });
+    } else {
+      return bot.sendMessage(chatId, `ℹ️ Сейчас выбран режим «${bt === "image" ? "Фото из текста" : "Видео из текста"}». Фото не нужны.\nДля режима «Видео из фото» смени тип в пакетном меню.`, {
+        reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch_menu" }]] }
+      });
+    }
   }
   if (s.step === "waiting_keyframe_start") {
     s.keyframeStart = fileId; s.step = "waiting_keyframe_end";
@@ -1141,21 +1201,36 @@ async function runKeyframes(chatId, s, prompt) {
 // ─── Пакетная генерация ───────────────────
 async function runBatch(chatId) {
   const s = getState(chatId);
-  const isImage = s.tab === "image";
+  const bt = s.batchType || "image";
+  const isImage = bt === "image";
+  const isVideoImage = bt === "video_image";
   const model = isImage ? IMAGE_MODELS[s.imgModel] : VIDEO_MODELS[s.vidModel];
   const prompts = [...s.batchPrompts];
   const photos = [...s.batchPhotos];
   const perPrompt = s.perPrompt || 1;
 
   if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
+  if (isVideoImage && photos.length === 0) return bot.sendMessage(chatId, "❌ Для режима «Видео из фото» нужно добавить фото!");
 
   const tasks = [];
-  for (let pi=0; pi<prompts.length; pi++)
-    for (let vi=0; vi<perPrompt; vi++)
-      tasks.push({ prompt: prompts[pi], idx: `${pi+1}.${vi+1}`, ep: isImage ? model.ep : model.epT, isImg: isImage, fileId: null });
-  for (let fi=0; fi<photos.length; fi++)
-    for (let vi=0; vi<perPrompt; vi++)
-      tasks.push({ prompt: "animate", idx: `${prompts.length+fi+1}.${vi+1}`, ep: VIDEO_MODELS[s.vidModel].epI, isImg: false, fileId: photos[fi] });
+
+  if (isVideoImage) {
+    // Видео из фото: каждое фото + (промпт или "animate") × perPrompt
+    for (let fi = 0; fi < photos.length; fi++) {
+      const prompt = prompts[fi] || prompts[0] || "animate";
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt, idx: `ф${fi+1}.${vi+1}`, ep: model.epI || model.epT, isImg: false, fileId: photos[fi] });
+    }
+    // Если промптов больше чем фото — добавим видео из текста для остатка промптов
+    for (let pi = photos.length; pi < prompts.length; pi++)
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt: prompts[pi], idx: `т${pi+1}.${vi+1}`, ep: model.epT, isImg: false, fileId: null });
+  } else {
+    // Фото из текста или видео из текста
+    for (let pi = 0; pi < prompts.length; pi++)
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt: prompts[pi], idx: `${pi+1}.${vi+1}`, ep: isImage ? model.ep : model.epT, isImg: isImage, fileId: null });
+  }
 
   const total = tasks.length;
 
