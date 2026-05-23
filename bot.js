@@ -212,9 +212,11 @@ async function pollResult(opId, max=36, interval=10000) {
         headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
       });
       const st = data.status || data.state;
+      console.log(`[poll] opId=${opId} i=${i} status=${st} keys=${Object.keys(data).join(",")}`);
       if (["completed","success","done","finished"].includes(st)) return extractMedia(data);
       if (["failed","error","cancelled"].includes(st)) {
-        const reason = data.error || data.message || data.detail || st;
+        const reason = data.error || data.message || data.detail || JSON.stringify(data).slice(0,300);
+        console.log(`[poll] FAILED opId=${opId} reason=${reason}`);
         throw new Error(`Статус: ${st}${reason !== st ? ` — ${reason}` : ""}`);
       }
     } catch(e) { if (e.message.startsWith("Статус")) throw e; }
