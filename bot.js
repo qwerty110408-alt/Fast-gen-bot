@@ -109,162 +109,85 @@ async function pollResult(opId, max=36, interval=10000) {
 
 // ─── Баланс ───────────────────────────────
 async function getUsageData() {
-  // Try different known endpoints
-  const endpoints = [
-    "/api/v5/usage",
-    "/api/v4/usage",
-    "/api/v5/user/usage",
-    "/api/v5/limits",
-    "/api/v4/limits",
-  ];
-  for (const ep of endpoints) {
-    try {
-      const { data } = await axios.get(`${BASE_URL}${ep}`, {
-        headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
-      });
-      console.log(`[balance OK] endpoint=${ep}`);
-      console.log(`[balance FULL]`, (JSON.stringify(data) || "").slice(0, 2000));
-      return data;
-    } catch(e) {
-      console.log(`[balance FAIL] endpoint=${ep} status=${e.response?.status} msg=${e.message}`);
-    }
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
+    });
+    return data;
+  } catch(e) {
+    console.error("[balance error]", e.message);
+    return null;
   }
-  return null;
 }
 
-function getVal(v) {
-  if (v == null) return null;
-  if (typeof v === "number") return v;
-  if (typeof v === "object") {
-    return v.used ?? v.count ?? v.requests ?? v.value ?? v.current ?? v.consumed ?? null;
-  }
-  return null;
-}
-function getLim(v) {
-  if (v == null) return null;
-  if (typeof v === "number") return v;
-  if (typeof v === "object") {
-    return v.limit ?? v.max ?? v.total ?? v.allowed ?? v.maximum ?? v.quota ?? null;
-  }
-  return null;
+// HourlyUsageStats: { used, limit } или null
+function parseStats(v, fallbackLimit) {
+  if (v == null) return { used: null, limit: fallbackLimit ?? null };
+  if (typeof v === "number") return { used: v, limit: fallbackLimit ?? null };
+  return {
+    used:  v.used  ?? v.count ?? v.requests ?? v.value ?? null,
+    limit: v.limit ?? v.max   ?? v.total    ?? v.quota ?? fallbackLimit ?? null,
+  };
 }
 
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс";
-
   try {
-    const cur    = (usage.currentusage || usage.current_usage || usage) || {};
-    const limRaw = usage.accountlimits || usage.account_limits || {};
-    const limObj = (limRaw && typeof limRaw === "object") ? limRaw : {};
+    const cur     = usage.current_usage   || {};
+    const hourly  = cur.hourly_usage      || {};
+    const threads = cur.active_threads    || {};
+    const lim     = usage.account_limits  || {};
 
-    // win может быть массивом или объектом
-    const winRaw = usage.usagewindow || usage.usage_window || {};
-    const win    = Array.isArray(winRaw)
-      ? (winRaw.find(x => x && typeof x === "object" && !Array.isArray(x)) || {})
-      : (winRaw && typeof winRaw === "object" ? winRaw : {});
+    const img = parseStats(hourly.image_generation,  lim.img_gen_per_hour_limit ?? lim.image_gen_per_hour_limit);
+    const vid = parseStats(hourly.video_generation,  lim.video_gen_per_hour_limit);
+    const tok = parseStats(hourly.prompt_generation, lim.prompt_tokens_per_hour_limit);
 
-    // hourly — ищем на ВСЕХ уровнях сразу
-    const hourly = (
-      usage.hourlyusage ||
-      usage.hourly_usage ||
-      cur.hourlyusage ||
-      cur.hourly_usage ||
-      cur.hourly ||
-      cur.usage ||
-      {}
-    );
-    const hourlyObj = (hourly && typeof hourly === "object") ? hourly : {};
-    const curObj = (cur && typeof cur === "object") ? cur : {};
-
-    // Поля могут быть числом ИЛИ объектом {used, limit}
-    const imgRaw = hourlyObj.image_generation ?? curObj.image_generation ?? usage.image_generation;
-    const vidRaw = hourlyObj.video_generation ?? curObj.video_generation ?? usage.video_generation;
-    const tokRaw = hourlyObj.prompt_generation ?? curObj.prompt_generation ?? usage.prompt_generation;
-    const thrRaw = curObj.activethreads       ?? curObj.active_threads    ?? hourlyObj.activethreads;
-
-    const imgUsed  = getVal(imgRaw) ?? "?";
-    const imgTotal = getLim(imgRaw) ?? limObj.img_gen_per_hour_limit ?? "?";
-    const vidUsed  = getVal(vidRaw) ?? "?";
-    const vidTotal = getLim(vidRaw) ?? limObj.video_gen_per_hour_limit ?? "?";
-    const tokUsed  = getVal(tokRaw);
-    const tokTotal = getLim(tokRaw) ?? limObj.prompt_tokens_per_hour_limit ?? null;
-
-    // Потоки
-    let imgThreadsUsed = null, vidThreadsUsed = null;
-    if (thrRaw && typeof thrRaw === "object") {
-      imgThreadsUsed = thrRaw.image_generation ?? thrRaw.img ?? thrRaw.image ?? getVal(thrRaw);
-      vidThreadsUsed = thrRaw.video_generation ?? thrRaw.vid ?? thrRaw.video ?? getVal(thrRaw);
-    } else if (typeof thrRaw === "number") {
-      imgThreadsUsed = thrRaw;
-      vidThreadsUsed = thrRaw;
-    }
-    const imgThreadsMax = limObj.img_generation_threads_allowed ?? limObj.image_generation_threads_allowed ?? null;
-    const vidThreadsMax = limObj.video_generation_threads_allowed ?? limObj.videogenerationthreadsallowed ?? null;
-
-    // Время сброса
-    const resetMin = (
-      win.reset_in_minutes ?? win.reset_in ?? win.minutes_remaining ??
-      usage.reset_in_minutes ?? usage.reset_in ?? cur.reset_in_minutes ?? null
-    );
-    const resetAtRaw = (
-      win.reset_at ?? win.resets_at ?? win.next_reset ??
-      usage.reset_at ?? usage.resets_at ?? cur.reset_at ?? null
-    );
-    let resetStr = "?";
-    if (typeof resetMin === "number") {
-      const h = Math.floor(resetMin / 60);
-      const m = Math.floor(resetMin % 60);
-      resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
-      if (resetAtRaw) { try { resetStr += ` (в ${new Date(resetAtRaw).toLocaleTimeString("ru")})`; } catch {} }
-    } else if (resetAtRaw) {
-      try { resetStr = new Date(resetAtRaw).toLocaleTimeString("ru"); } catch {}
-    }
-
-    // Форматирование токенов (200000 → 200k)
+    const fmt = (v) => (v != null ? v : "?");
     function fmtTok(n) {
       if (n == null) return "?";
-      if (typeof n !== "number") return String(n);
       if (n >= 1000000) return `${(n/1000000).toFixed(1).replace(".0","")}M`;
       if (n >= 1000) return `${Math.round(n/1000)}k`;
       return String(n);
     }
 
-    const tokLine = tokUsed != null
-      ? `💬 Токены промптов: ${fmtTok(tokUsed)}/${fmtTok(tokTotal)}\n`
-      : "";
-    const threadLine = (imgThreadsUsed != null || imgThreadsMax != null)
-      ? `🔄 Потоки: 🖼 ${imgThreadsUsed ?? "?"}/${imgThreadsMax ?? "?"} | 🎬 ${vidThreadsUsed ?? "?"}/${vidThreadsMax ?? "?"}\n`
-      : "";
+    // active_threads.image_threads / video_threads
+    const imgT    = threads.image_threads;
+    const vidT    = threads.video_threads;
+    const imgTMax = lim.image_generation_threads_allowed ?? lim.img_generation_threads_allowed;
+    const vidTMax = lim.video_generation_threads_allowed;
 
-    try {
-      console.log("[BAL hourly]", JSON.stringify(hourlyObj).substring(0, 500));
-      console.log("[BAL cur keys]", Object.keys(curObj).join(", "));
-      console.log("[BAL usage keys]", Object.keys(usage).join(", "));
-    } catch(_) {}
-
-    let debug = "";
-    try {
-      if (imgUsed === "?" && vidUsed === "?") {
-        const hkeys = Object.keys(hourlyObj).join(", ").substring(0, 120);
-        const imgStr = imgRaw === undefined ? "undefined" : imgRaw === null ? "null" : JSON.stringify(imgRaw).substring(0, 100);
-        debug = `\n[hourly keys: ${hkeys}]\n[img_raw: ${imgStr}]\n`;
-      }
-      if (resetStr === "?") {
-        const wkeys = Object.keys(win).join(", ").substring(0, 80);
-        debug += `[win: ${wkeys || "пусто"}]\n`;
-      }
-    } catch(_) {
-      debug = "\n[debug error]\n";
+    // Время сброса
+    const resetMin = lim.reset_in_minutes ?? lim.reset_in ?? cur.reset_in_minutes ?? null;
+    const resetAt  = lim.reset_at ?? lim.resets_at ?? cur.reset_at ?? usage.reset_at ?? null;
+    let resetStr = null;
+    if (typeof resetMin === "number") {
+      const h = Math.floor(resetMin / 60), m = Math.floor(resetMin % 60);
+      resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
+    } else if (resetAt) {
+      try { resetStr = new Date(resetAt).toLocaleTimeString("ru"); } catch {}
     }
+
+    // Срок лицензии
+    let expStr = null;
+    if (usage.expiration_date) {
+      try {
+        const diff = Math.round((usage.expiration_date - Date.now()) / 86400000);
+        expStr = diff > 0 ? `${diff}d` : "истекла";
+      } catch {}
+    }
+
+    const tokLine    = tok.used != null ? `💬 Токены: ${fmtTok(tok.used)}/${fmtTok(tok.limit)}\n` : "";
+    const threadLine = (imgT != null || imgTMax != null)
+      ? `🔄 Потоки: 🖼 ${fmt(imgT)}/${fmt(imgTMax)} | 🎬 ${fmt(vidT)}/${fmt(vidTMax)}\n` : "";
+    const resetLine  = resetStr ? `⏱ Сброс через: ${resetStr}\n` : "";
+    const expLine    = expStr   ? `📅 Лицензия: ${expStr}\n` : "";
 
     return (
       `📊 Баланс и лимиты\n\n` +
-      `🖼 Изображения: ${imgUsed}/${imgTotal}\n` +
-      `🎬 Видео: ${vidUsed}/${vidTotal}\n` +
-      tokLine + threadLine +
-      `⏱ Сброс через: ${resetStr}\n` +
-      debug + `\n` +
-      `Стоимость моделей:\n` +
+      `🖼 Изображения: ${fmt(img.used)}/${fmt(img.limit)}\n` +
+      `🎬 Видео: ${fmt(vid.used)}/${fmt(vid.limit)}\n` +
+      tokLine + threadLine + resetLine + expLine +
+      `\nСтоимость моделей:\n` +
       `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
       `🖼 Grok быстро: 1 кред = 6 фото\n` +
       `🖼 Grok качество: 1 кред = 4 фото\n` +
@@ -277,7 +200,6 @@ function formatBalance(usage) {
     return `❌ Ошибка парсинга баланса: ${e.message}`;
   }
 }
-
 
 async function showBalance(chatId, msgId = null) {
   try {
@@ -1058,18 +980,25 @@ async function runBatch(chatId) {
 // ─── Одна задача ──────────────────────────
 async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx=null, overrideFileId=null) {
   const label = batchIdx || (total>1 ? `${index}/${total}` : "");
+  // Снапшот нужных полей состояния — защита от race condition при параллельных задачах
+  const snapFileId = overrideFileId || s.fileId;
+  const snapTab    = s.tab;
+  const snapRatio  = s.ratio;
+  const snapRes    = s.resolution;
+  const snapSeed   = s.seed;
   try {
+    // model.sub и model.model не могут быть одновременно — sub приоритетнее
+    const modelName = model.sub || model.model || undefined;
     const body = {
-      prompt, aspect_ratio: s.ratio,
-      ...(model.sub && { model: model.sub }),
-      ...(model.model && { model: model.model }),
-      ...(model.quality && { quality: model.quality }),
-      ...(model.res && { resolution: s.resolution || model.defaultRes || "720p" }),
-      ...(s.seed === "fixed" && { seed: 42 }),
+      prompt,
+      aspect_ratio: snapRatio,
+      ...(modelName                  && { model: modelName }),
+      ...(model.quality              && { quality: model.quality }),
+      ...(model.res                  && { resolution: snapRes || model.defaultRes || "720p" }),
+      ...(snapSeed === "fixed"       && { seed: 42 }),
     };
-    const fid = overrideFileId || s.fileId;
-    if (fid && (s.tab==="video_image" || overrideFileId)) {
-      const f = await bot.getFile(fid);
+    if (snapFileId && (snapTab === "video_image" || overrideFileId)) {
+      const f = await bot.getFile(snapFileId);
       const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
     }
