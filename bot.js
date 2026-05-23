@@ -113,6 +113,8 @@ async function getUsageData() {
     const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
       headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
     });
+    // DEBUG: удалить после первого запуска и проверки лога
+    console.log("[usage]", JSON.stringify(data).slice(0, 3000));
     return data;
   } catch(e) {
     console.error("[balance error]", e.message);
@@ -120,21 +122,28 @@ async function getUsageData() {
   }
 }
 
+// Парсит HourlyUsageStats — возвращает { used, limit }
+function parseStats(v, fallbackLimit) {
+  if (v == null) return { used: null, limit: fallbackLimit ?? null };
+  if (typeof v === "number") return { used: v, limit: fallbackLimit ?? null };
+  return {
+    used:  v.used  ?? v.count ?? v.requests ?? v.value ?? null,
+    limit: v.limit ?? v.max   ?? v.total    ?? v.quota ?? fallbackLimit ?? null,
+  };
+}
+
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс";
   try {
-    // Схема: usage.current_usage.hourly_usage.{image_generation, video_generation, prompt_generation}
-    //        usage.current_usage.active_threads.{image_threads, video_threads}
-    //        usage.account_limits
-    //        usage.usage_window (строка "per_hour")
-    const cur    = usage.current_usage || {};
-    const hourly = cur.hourly_usage || {};
+    const cur     = usage.current_usage || {};
+    const hourly  = cur.hourly_usage   || {};
     const threads = cur.active_threads || {};
-    const lim    = usage.account_limits || {};
+    const lim     = usage.account_limits || {};
 
-    const img = hourly.image_generation || {};
-    const vid = hourly.video_generation || {};
-    const tok = hourly.prompt_generation || {};
+    // Парсим HourlyUsageStats для каждого типа
+    const img = parseStats(hourly.image_generation,  lim.img_gen_per_hour_limit ?? lim.image_gen_per_hour_limit);
+    const vid = parseStats(hourly.video_generation,  lim.video_gen_per_hour_limit);
+    const tok = parseStats(hourly.prompt_generation, lim.prompt_tokens_per_hour_limit);
 
     const fmt = (v) => (v != null ? v : "?");
     function fmtTok(n) {
@@ -144,23 +153,44 @@ function formatBalance(usage) {
       return String(n);
     }
 
-    const tokLine = tok.used != null
-      ? `💬 Токены промптов: ${fmtTok(tok.used)}/${fmtTok(tok.limit ?? lim.prompt_tokens_per_hour_limit)}\n`
-      : "";
-
-    const imgT = threads.image_threads;
-    const vidT = threads.video_threads;
-    const imgTMax = lim.image_generation_threads_allowed;
+    // Потоки: active_threads.image_threads / video_threads
+    const imgT    = threads.image_threads;
+    const vidT    = threads.video_threads;
+    const imgTMax = lim.image_generation_threads_allowed ?? lim.img_generation_threads_allowed;
     const vidTMax = lim.video_generation_threads_allowed;
+
+    // Время сброса — может быть в account_limits или current_usage
+    const resetMin = lim.reset_in_minutes ?? lim.reset_in ?? cur.reset_in_minutes ?? null;
+    const resetAt  = lim.reset_at ?? lim.resets_at ?? cur.reset_at ?? usage.reset_at ?? null;
+    let resetStr = null;
+    if (typeof resetMin === "number") {
+      const h = Math.floor(resetMin / 60), m = Math.floor(resetMin % 60);
+      resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
+    } else if (resetAt) {
+      try { resetStr = new Date(resetAt).toLocaleTimeString("ru"); } catch {}
+    }
+
+    // Дата истечения лицензии
+    let expStr = null;
+    if (usage.expiration_date) {
+      try {
+        const diff = Math.round((usage.expiration_date - Date.now()) / 86400000);
+        expStr = diff > 0 ? `${diff}d` : "истекла";
+      } catch {}
+    }
+
+    const tokLine    = tok.used != null
+      ? `💬 Токены: ${fmtTok(tok.used)}/${fmtTok(tok.limit)}\n` : "";
     const threadLine = (imgT != null || imgTMax != null)
-      ? `🔄 Потоки: 🖼 ${fmt(imgT)}/${fmt(imgTMax)} | 🎬 ${fmt(vidT)}/${fmt(vidTMax)}\n`
-      : "";
+      ? `🔄 Потоки: 🖼 ${fmt(imgT)}/${fmt(imgTMax)} | 🎬 ${fmt(vidT)}/${fmt(vidTMax)}\n` : "";
+    const resetLine  = resetStr ? `⏱ Сброс через: ${resetStr}\n` : "";
+    const expLine    = expStr   ? `📅 Лицензия: ${expStr}\n` : "";
 
     return (
       `📊 Баланс и лимиты\n\n` +
-      `🖼 Изображения: ${fmt(img.used)}/${fmt(img.limit ?? lim.img_gen_per_hour_limit)}\n` +
-      `🎬 Видео: ${fmt(vid.used)}/${fmt(vid.limit ?? lim.video_gen_per_hour_limit)}\n` +
-      tokLine + threadLine +
+      `🖼 Изображения: ${fmt(img.used)}/${fmt(img.limit)}\n` +
+      `🎬 Видео: ${fmt(vid.used)}/${fmt(vid.limit)}\n` +
+      tokLine + threadLine + resetLine + expLine +
       `\nСтоимость моделей:\n` +
       `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
       `🖼 Grok быстро: 1 кред = 6 фото\n` +
@@ -744,19 +774,29 @@ bot.on("photo", async (msg) => {
 bot.on("document", async (msg) => {
   const chatId = msg.chat.id;
   const s = getState(chatId);
-  if (!["waiting_pg_file", "waiting_txt_file"].includes(s.step)) return;
-  if (!msg.document.file_name.endsWith(".txt")) return bot.sendMessage(chatId, "❌ Нужен .txt файл!");
 
-  const isPgFile = s.step === "waiting_pg_file";
+  // Генерация промптов из файла
+  if (s.step === "waiting_pg_file") {
+    if (!msg.document.file_name.endsWith(".txt")) return bot.sendMessage(chatId, "❌ Нужен .txt файл!");
+    s.step = null;
+    try {
+      const f = await bot.getFile(msg.document.file_id);
+      const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+      const text = Buffer.from(resp.data).toString("utf-8");
+      return runPromptGen(chatId, text);
+    } catch(e) {
+      return bot.sendMessage(chatId, `❌ Ошибка чтения файла: ${e.message}`);
+    }
+  }
+
+  if (s.step !== "waiting_txt_file") return;
+  if (!msg.document.file_name.endsWith(".txt")) return bot.sendMessage(chatId, "❌ Нужен .txt файл!");
   s.step = null;
 
   try {
     const f = await bot.getFile(msg.document.file_id);
     const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
     const text = Buffer.from(resp.data).toString("utf-8");
-
-    if (isPgFile) return runPromptGen(chatId, text);
-
     const prompts = text.split("\n").map(p => p.trim()).filter(Boolean);
     const isImage = s.tab === "image";
     const MAX_PROMPTS = isImage ? 500 : 15;
