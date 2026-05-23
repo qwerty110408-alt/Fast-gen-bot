@@ -7,6 +7,13 @@ const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
 const BASE_URL = "https://googler.fast-gen.ai";
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// ─── Команды в меню Telegram ──────────────
+bot.setMyCommands([
+  { command: "start",  description: "♻️ Перезапустить бота" },
+  { command: "image",  description: "🖼️ Сделать изображение из текста" },
+  { command: "video",  description: "🎬 Сделать видео из текста" },
+]);
+
 // ─── Персистентное состояние ──────────────
 const STATE_FILE = "./user_states.json";
 const BALANCE_FILE = "./balance_state.json";
@@ -498,6 +505,32 @@ bot.onText(/\/start|\/menu/, (msg) => {
   const chatId = msg.chat.id;
   getState(chatId); // инициализация
   showMainMenu(chatId);
+});
+
+bot.onText(/\/image/, (msg) => {
+  const chatId = msg.chat.id;
+  const s = getState(chatId);
+  s.step = "waiting_prompt"; s.tab = "image"; s.mode = "normal";
+  bot.sendMessage(chatId, `🖼️ *Изображение из текста*
+${IMAGE_MODELS[s.imgModel].label}
+
+Напиши промпт:`, {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+  });
+});
+
+bot.onText(/\/video/, (msg) => {
+  const chatId = msg.chat.id;
+  const s = getState(chatId);
+  s.step = "waiting_prompt"; s.tab = "video_text"; s.mode = "normal";
+  bot.sendMessage(chatId, `🎬 *Видео из текста*
+${VIDEO_MODELS[s.vidModel].label}
+
+Опиши видео:`, {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+  });
 });
 
 bot.onText(/\/check (.+)/, async (msg, match) => {
