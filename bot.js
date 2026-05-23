@@ -116,18 +116,15 @@ async function getUsageData() {
       const { data } = await axios.get(`${BASE_URL}${ep}`, {
         headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
       });
-      console.log(`[balance OK] endpoint=${ep} data=`, JSON.stringify(data).slice(0, 800));
+      console.log(`[balance OK] endpoint=${ep}`);
+      console.log(`[balance win]`, JSON.stringify(data.usagewindow || data.usage_window || "none").slice(0, 300));
+      console.log(`[balance cur]`, JSON.stringify(data.currentusage?.hourlyusage || "none").slice(0, 300));
       return data;
     } catch(e) {
       console.log(`[balance FAIL] endpoint=${ep} status=${e.response?.status} msg=${e.message}`);
     }
   }
   return null;
-}
-
-function escMd(v) {
-  if (v == null) return "?";
-  return String(v).replace(/[_*`\[\]()~>#+=|{}.!\\-]/g, "\\$&");
 }
 
 function formatBalance(usage) {
@@ -138,49 +135,52 @@ function formatBalance(usage) {
   const win    = usage.usagewindow   || usage.usage_window  || {};
   const hourly = cur.hourlyusage     || cur.hourly_usage    || cur;
 
-  const imgUsed  = hourly.images   ?? hourly.image_count ?? hourly.imggen   ?? "?";
-  const imgTotal = lim.imggenperhourlimit ?? lim.img_gen_per_hour_limit     ?? lim.images ?? "?";
-  const vidUsed  = hourly.videos   ?? hourly.video_count ?? hourly.videogen ?? "?";
-  const vidTotal = lim.videogenperhourlimit ?? lim.video_gen_per_hour_limit ?? lim.videos ?? "?";
-  const tokUsed  = hourly.prompt_tokens ?? hourly.prompttokens ?? hourly.tokens ?? null;
-  const tokTotal = lim.prompttokensperhourlimit ?? lim.prompt_tokens_per_hour_limit ?? null;
-  const threads    = cur.activethreads ?? cur.active_threads ?? null;
-  const imgThreads = lim.imggenerationthreadsallowed   ?? null;
-  const vidThreads = lim.videogenerationthreadsallowed ?? null;
+  // Exact field names confirmed from debug:
+  // hourly: image_generation, video_generation, prompt_generation, flow_ultra_generation
+  // lim: img_gen_per_hour_limit, video_gen_per_hour_limit,
+  //      img_generation_threads_allowed, video_generation_threads_allowed,
+  //      prompt_tokens_per_hour_limit, flow_ultra_hour_limit, flow_ultra_threads_allowed
 
+  const imgUsed  = hourly.image_generation  ?? "?";
+  const imgTotal = lim.img_gen_per_hour_limit ?? "?";
+  const vidUsed  = hourly.video_generation  ?? "?";
+  const vidTotal = lim.video_gen_per_hour_limit ?? "?";
+  const tokUsed  = hourly.prompt_generation ?? null;
+  const tokTotal = lim.prompt_tokens_per_hour_limit ?? null;
+  const threads    = cur.activethreads ?? cur.active_threads ?? null;
+  const imgThreads = lim.img_generation_threads_allowed   ?? null;
+  const vidThreads = lim.video_generation_threads_allowed ?? null;
+
+  // Reset time
   const resetMin   = win.reset_in_minutes ?? win.reset_in ?? usage.reset_in_minutes ?? null;
   const resetAtRaw = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
   let resetStr = "?";
-  if (resetMin != null) resetStr = `${Math.floor(resetMin)}м`;
-  else if (resetAtRaw) { try { resetStr = new Date(resetAtRaw).toLocaleTimeString("ru"); } catch {} }
+  if (resetMin != null) {
+    resetStr = `${Math.floor(resetMin)}м`;
+    if (resetAtRaw) { try { resetStr += ` (в ${new Date(resetAtRaw).toLocaleTimeString("ru")})`; } catch {} }
+  } else if (resetAtRaw) {
+    try { resetStr = new Date(resetAtRaw).toLocaleTimeString("ru"); } catch {}
+  }
 
-  const tokLine    = tokUsed  != null ? `💬 Токены: ${escMd(tokUsed)}/${escMd(tokTotal)}\n` : "";
+  const tokLine    = tokUsed  != null ? `💬 Токены: ${tokUsed}/${tokTotal ?? "?"}\n` : "";
   const threadLine = threads  != null
-    ? `🔄 Потоки: 🖼 ${escMd(threads)}/${escMd(imgThreads)} | 🎬 ${escMd(threads)}/${escMd(vidThreads)}\n`
-    : "";
-
-  const allUnknown = imgUsed === "?" && vidUsed === "?";
-  const debugLine  = allUnknown
-    ? `\nhourly keys: ${Object.keys(hourly).join(", ")}\nlim keys: ${Object.keys(lim).join(", ")}\n`
-    : "";
-
-  const time = new Date().toLocaleTimeString("ru");
+    ? `🔄 Потоки: 🖼 ${threads}/${imgThreads ?? "?"} | 🎬 ${threads}/${vidThreads ?? "?"}\n`
+    : (imgThreads != null ? `🔄 Потоки: 🖼 ?/${imgThreads} | 🎬 ?/${vidThreads ?? "?"}\n` : "");
 
   return (
     `📊 Баланс и лимиты\n\n` +
     `🖼 Изображения: ${imgUsed}/${imgTotal}\n` +
     `🎬 Видео: ${vidUsed}/${vidTotal}\n` +
     tokLine + threadLine +
-    `⏱ Сброс через: ${resetStr}\n` +
-    debugLine + `\n` +
+    `⏱ Сброс через: ${resetStr}\n\n` +
     `Стоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
     `🖼 Grok качество: 1 кред = 4 фото\n` +
     `🖼 NanoBanana Flower / ChatGPT: 1 кред\n` +
     `🎬 Veo 3.1 Fast/Light/Flower/Grok: 1 кред\n` +
-    `🎬 Veo 3.1 Quality: 10 кред ⚠️\n\n` +
-    `Обновлено: ${time}`
+    `🎬 Veo 3.1 Quality: 10 кред\n\n` +
+    `Обновлено: ${new Date().toLocaleTimeString("ru")}`
   );
 }
 
