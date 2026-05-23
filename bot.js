@@ -115,7 +115,7 @@ async function getUsageData() {
       const { data } = await axios.get(`${BASE_URL}${ep}`, {
         headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
       });
-      console.log(`[balance OK] endpoint=${ep} data=`, JSON.stringify(data).slice(0, 500));
+      console.log(`[balance OK] endpoint=${ep} data=`, JSON.stringify(data).slice(0, 800));
       return data;
     } catch(e) {
       console.log(`[balance FAIL] endpoint=${ep} status=${e.response?.status} msg=${e.message}`);
@@ -127,51 +127,62 @@ async function getUsageData() {
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс\n\n_Проверь API ключ или попробуй позже_";
 
-  // API returns: { currentusage: {...}, accountlimits: {...}, usagewindow: {...} }
-  const cur = usage.currentusage || usage.current_usage || usage;
+  // API structure:
+  // currentusage: { hourlyusage: { images, videos, prompt_tokens, ... }, activethreads: N }
+  // accountlimits: { imggenperhourlimit, videogenperhourlimit, imggenerationthreadsallowed,
+  //                  videogenerationthreadsallowed, prompttokensperhourlimit,
+  //                  flowultrahourlimit, flowultrathreadsallowed }
+  // usagewindow:   { reset_at / resets_at / reset_in_minutes }
+
+  const cur = usage.currentusage  || usage.current_usage || usage;
   const lim = usage.accountlimits || usage.account_limits || usage;
-  const win = usage.usagewindow  || usage.usage_window   || usage;
+  const win = usage.usagewindow   || usage.usage_window  || {};
+
+  const hourly = cur.hourlyusage || cur.hourly_usage || cur;
 
   // Images
-  const imgUsed  = cur.images ?? cur.image_count ?? cur.images_used  ?? "?";
-  const imgTotal = lim.images ?? lim.image_limit ?? lim.images_limit ?? "?";
+  const imgUsed  = hourly.images ?? hourly.image_count ?? hourly.imggen ?? "?";
+  const imgTotal = lim.imggenperhourlimit ?? lim.img_gen_per_hour_limit ?? lim.images ?? "?";
 
   // Videos
-  const vidUsed  = cur.videos ?? cur.video_count ?? cur.videos_used  ?? "?";
-  const vidTotal = lim.videos ?? lim.video_limit ?? lim.videos_limit ?? "?";
+  const vidUsed  = hourly.videos ?? hourly.video_count ?? hourly.videogen ?? "?";
+  const vidTotal = lim.videogenperhourlimit ?? lim.video_gen_per_hour_limit ?? lim.videos ?? "?";
 
   // Prompt tokens
-  const tokUsed  = cur.prompt_tokens ?? cur.tokens ?? cur.prompts ?? null;
-  const tokTotal = lim.prompt_tokens ?? lim.tokens ?? lim.prompts ?? null;
+  const tokUsed  = hourly.prompt_tokens ?? hourly.prompttokens ?? hourly.tokens ?? null;
+  const tokTotal = lim.prompttokensperhourlimit ?? lim.prompt_tokens_per_hour_limit ?? null;
 
-  // Streams
-  const streams   = cur.streams ?? cur.active_threads ?? cur.concurrent ?? null;
-  const maxStreams = lim.streams ?? lim.max_threads    ?? lim.concurrent ?? null;
+  // Threads (activethreads is a number directly on currentusage)
+  const threads    = cur.activethreads ?? cur.active_threads ?? null;
+  const imgThreads = lim.imggenerationthreadsallowed ?? null;
+  const vidThreads = lim.videogenerationthreadsallowed ?? null;
 
-  // Reset time — check usagewindow first
+  // Reset time from usagewindow
   const resetMin = win.reset_in_minutes ?? win.reset_in ?? win.minutes_until_reset ??
-                   usage.reset_in_minutes ?? usage.reset_in ?? null;
-  const resetAt  = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
+                   usage.reset_in_minutes ?? null;
+  const resetAtRaw = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
   const resetStr = resetMin != null
-    ? `*${Math.floor(resetMin)}м*${resetAt ? ` (в ${new Date(resetAt).toLocaleTimeString("ru")})` : ""}`
-    : resetAt
-      ? `*${new Date(resetAt).toLocaleTimeString("ru")}*`
+    ? `*${Math.floor(resetMin)}м*${resetAtRaw ? ` (в ${new Date(resetAtRaw).toLocaleTimeString("ru")})` : ""}`
+    : resetAtRaw
+      ? `*${new Date(resetAtRaw).toLocaleTimeString("ru")}*`
       : "*?*";
 
   const tokLine     = tokUsed  != null ? `💬 Токены: *${tokUsed}/${tokTotal ?? "?"}*\n` : "";
-  const streamsLine = streams  != null ? `🔄 Потоки: *${streams}/${maxStreams ?? "?"}*\n` : "";
+  const threadLine  = threads  != null
+    ? `🔄 Потоки: 🖼 *${threads}/${imgThreads ?? "?"}* | 🎬 *${threads}/${vidThreads ?? "?"}*\n`
+    : "";
 
-  // If still all unknown — show raw keys to debug
+  // Debug only if still unknown
   const allUnknown = imgUsed === "?" && vidUsed === "?";
   const debugLine  = allUnknown
-    ? `\n_cur: ${Object.keys(cur).join(", ")}_\n_lim: ${Object.keys(lim).join(", ")}_\n`
+    ? `\n_hourly: ${Object.keys(hourly).join(", ")}_\n_lim: ${Object.keys(lim).join(", ")}_\n`
     : "";
 
   return (
     `📊 *Баланс и лимиты*\n\n` +
     `🖼 Изображения: *${imgUsed}/${imgTotal}*\n` +
     `🎬 Видео: *${vidUsed}/${vidTotal}*\n` +
-    tokLine + streamsLine +
+    tokLine + threadLine +
     `⏱ Сброс через: ${resetStr}\n` +
     debugLine + `\n` +
     `*Стоимость моделей:*\n` +
