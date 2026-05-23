@@ -127,52 +127,51 @@ async function getUsageData() {
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс\n\n_Проверь API ключ или попробуй позже_";
 
-  // Flatten nested objects (some APIs wrap in {data: {...}} or {usage: {...}})
-  const u = usage.data || usage.usage || usage.limits || usage;
+  // API returns: { currentusage: {...}, accountlimits: {...}, usagewindow: {...} }
+  const cur = usage.currentusage || usage.current_usage || usage;
+  const lim = usage.accountlimits || usage.account_limits || usage;
+  const win = usage.usagewindow  || usage.usage_window   || usage;
 
   // Images
-  const imgUsed  = u.images_used   ?? u.image_used   ?? u.images?.used   ?? "?";
-  const imgTotal = u.images_limit  ?? u.image_limit  ?? u.images?.limit  ??
-                   u.images_total  ?? u.image_total  ?? "?";
+  const imgUsed  = cur.images ?? cur.image_count ?? cur.images_used  ?? "?";
+  const imgTotal = lim.images ?? lim.image_limit ?? lim.images_limit ?? "?";
 
   // Videos
-  const vidUsed  = u.videos_used   ?? u.video_used   ?? u.videos?.used   ?? "?";
-  const vidTotal = u.videos_limit  ?? u.video_limit  ?? u.videos?.limit  ??
-                   u.videos_total  ?? u.video_total  ?? "?";
+  const vidUsed  = cur.videos ?? cur.video_count ?? cur.videos_used  ?? "?";
+  const vidTotal = lim.videos ?? lim.video_limit ?? lim.videos_limit ?? "?";
 
   // Prompt tokens
-  const tokUsed  = u.prompt_tokens_used  ?? u.tokens_used  ?? u.prompts?.used  ?? null;
-  const tokTotal = u.prompt_tokens_limit ?? u.tokens_limit ?? u.prompts?.limit ?? null;
+  const tokUsed  = cur.prompt_tokens ?? cur.tokens ?? cur.prompts ?? null;
+  const tokTotal = lim.prompt_tokens ?? lim.tokens ?? lim.prompts ?? null;
 
-  // Streams / threads
-  const streams    = u.active_threads ?? u.concurrent_tasks ?? u.streams ?? u.active ?? null;
-  const maxStreams  = u.max_threads   ?? u.max_concurrent   ?? u.max_streams          ?? null;
+  // Streams
+  const streams   = cur.streams ?? cur.active_threads ?? cur.concurrent ?? null;
+  const maxStreams = lim.streams ?? lim.max_threads    ?? lim.concurrent ?? null;
 
-  // Reset
-  const resetMin = u.reset_in_minutes ?? u.reset_in_min ?? u.reset_in ??
-                   (u.reset_in_seconds != null ? Math.floor(u.reset_in_seconds / 60) : null);
-  const resetAt  = u.reset_at
-    ? new Date(u.reset_at).toLocaleTimeString("ru")
-    : null;
-
+  // Reset time — check usagewindow first
+  const resetMin = win.reset_in_minutes ?? win.reset_in ?? win.minutes_until_reset ??
+                   usage.reset_in_minutes ?? usage.reset_in ?? null;
+  const resetAt  = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
   const resetStr = resetMin != null
-    ? `*${Math.floor(resetMin)}м*${resetAt ? ` (в ${resetAt})` : ""}`
-    : resetAt ? `*${resetAt}*` : "*?*";
+    ? `*${Math.floor(resetMin)}м*${resetAt ? ` (в ${new Date(resetAt).toLocaleTimeString("ru")})` : ""}`
+    : resetAt
+      ? `*${new Date(resetAt).toLocaleTimeString("ru")}*`
+      : "*?*";
 
-  // Build lines
-  const imgLine     = `🖼 Изображения: *${imgUsed}/${imgTotal}*\n`;
-  const vidLine     = `🎬 Видео: *${vidUsed}/${vidTotal}*\n`;
-  const tokLine     = tokUsed != null ? `💬 Токены: *${tokUsed}/${tokTotal}*\n` : "";
-  const streamsLine = streams != null ? `🔄 Потоки: *${streams}/${maxStreams ?? "?"}*\n` : "";
+  const tokLine     = tokUsed  != null ? `💬 Токены: *${tokUsed}/${tokTotal ?? "?"}*\n` : "";
+  const streamsLine = streams  != null ? `🔄 Потоки: *${streams}/${maxStreams ?? "?"}*\n` : "";
 
-  // Debug: show raw keys if everything is "?"
-  const allUnknown = imgUsed === "?" && vidUsed === "?" && streams === null;
+  // If still all unknown — show raw keys to debug
+  const allUnknown = imgUsed === "?" && vidUsed === "?";
   const debugLine  = allUnknown
-    ? `\n_Ключи API: ${Object.keys(u).slice(0,10).join(", ")}_\n` : "";
+    ? `\n_cur: ${Object.keys(cur).join(", ")}_\n_lim: ${Object.keys(lim).join(", ")}_\n`
+    : "";
 
   return (
     `📊 *Баланс и лимиты*\n\n` +
-    imgLine + vidLine + tokLine + streamsLine +
+    `🖼 Изображения: *${imgUsed}/${imgTotal}*\n` +
+    `🎬 Видео: *${vidUsed}/${vidTotal}*\n` +
+    tokLine + streamsLine +
     `⏱ Сброс через: ${resetStr}\n` +
     debugLine + `\n` +
     `*Стоимость моделей:*\n` +
