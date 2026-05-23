@@ -224,19 +224,28 @@ function formatBalance(usage) {
       ? `🔄 Потоки: 🖼 ${imgThreadsUsed ?? "?"}/${imgThreadsMax ?? "?"} | 🎬 ${vidThreadsUsed ?? "?"}/${vidThreadsMax ?? "?"}\n`
       : "";
 
-    // Дебаг только если что-то не прочиталось
-    const dbg = [];
-    if (imgUsed === "?" && vidUsed === "?") {
-      const hkeys = Object.keys(hourly).join(", ").slice(0, 120);
-      dbg.push(`[hourly: ${hkeys}]`);
-      // Показываем RAW значение image_generation
-      dbg.push(`[img_raw: ${JSON.stringify(imgRaw).slice(0, 150)}]`);
+    // Полный дамп в консоль для диагностики
+    try {
+      console.log("[BAL hourly]", JSON.stringify(hourly).substring(0, 500));
+      console.log("[BAL cur keys]", Object.keys(curObj).join(", "));
+      console.log("[BAL usage keys]", Object.keys(usage).join(", "));
+    } catch(_) {}
+
+    // Дебаг в сообщение если значения не прочитались
+    let debug = "";
+    try {
+      if (imgUsed === "?" && vidUsed === "?") {
+        const hkeys = Object.keys(hourly).join(", ").substring(0, 120);
+        const imgStr = imgRaw === undefined ? "undefined" : imgRaw === null ? "null" : JSON.stringify(imgRaw).substring(0, 100);
+        debug = `\n[hourly keys: ${hkeys}]\n[img_raw: ${imgStr}]\n`;
+      }
+      if (resetStr === "?") {
+        const wkeys = Object.keys(win).join(", ").substring(0, 80);
+        debug += `[win: ${wkeys || "пусто"}]\n`;
+      }
+    } catch(_) {
+      debug = "\n[debug error]\n";
     }
-    if (resetStr === "?") {
-      const wkeys = Object.keys(win).join(", ").slice(0, 80);
-      dbg.push(`[win: ${wkeys || "пусто"}]`);
-    }
-    const debug = dbg.length ? `\n${dbg.join("\n")}\n` : "";
 
     return (
       `📊 Баланс и лимиты\n\n` +
