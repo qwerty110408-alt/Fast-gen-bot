@@ -20,6 +20,88 @@ function saveJSON(file, data) {
 
 const persistedStates = loadJSON(STATE_FILE, {});
 
+// ─── Очередь с ограничением параллельности ───
+function createQueue(concurrency) {
+  let running = 0;
+  const queue = [];
+  function next() {
+    while (running < concurrency && queue.length > 0) {
+      const { fn, resolve, reject } = queue.shift();
+      running++;
+      fn().then(v => { running--; resolve(v); next(); })
+          .catch(e => { running--; reject(e); next(); });
+    }
+  }
+  return function enqueue(fn) {
+    return new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+  };
+}
+
+const imageQueue = createQueue(10); // 10 параллельных для фото
+const videoQueue = createQueue(10); // 10 параллельных для видео
+
+// ─── Почасовой планировщик видео ─────────
+// chatId -> { tasks, statusMsgId, model, s }
+const videoScheduler = {};
+
+async function scheduleVideoChunk(chatId) {
+  const job = videoScheduler[chatId];
+  if (!job || job.tasks.length === 0) {
+    delete videoScheduler[chatId];
+    return;
+  }
+  const { tasks, model, s } = job;
+  const chunk = tasks.splice(0, 15); // берём до 15 задач
+  const total = job.totalTasks;
+  const done_before = job.doneSoFar;
+
+  const statusText = () =>
+    `⏰ *Почасовой пакет (видео)*
+` +
+    `Всего задач: ${total} | Осталось: ${job.tasks.length + chunk.length}
+` +
+    `✓${job.doneSoFar} ✗${job.errorsSoFar}
+` +
+    `Текущий пачок: ${chunk.length} задач`;
+
+  if (!job.statusMsgId) {
+    const m = await bot.sendMessage(chatId, statusText(), { parse_mode: "Markdown" });
+    job.statusMsgId = m.message_id;
+  } else {
+    await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
+  }
+
+  for (const task of chunk) {
+    videoQueue(async () => {
+      try {
+        await genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId);
+        job.doneSoFar++;
+      } catch { job.errorsSoFar++; }
+      await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
+    });
+  }
+  // Ждём завершения всех в чанке
+  await new Promise(r => setTimeout(r, 5000)); // небольшая пауза чтобы запустились
+
+  if (job.tasks.length > 0) {
+    // Сколько ждать до следующего часа
+    const msLeft = Math.max(0, balanceState.resetAt - Date.now());
+    const waitMs = msLeft + 2000; // +2 сек буфер после сброса
+    const resetTime = new Date(balanceState.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+    await bot.sendMessage(chatId, `⏳ Осталось *${job.tasks.length}* видео-задач.
+Запущу следующий пачок в *${resetTime}* (после сброса лимита).
+Можно закрыть бот — он сам продолжит.`, { parse_mode: "Markdown" });
+    setTimeout(() => scheduleVideoChunk(chatId), waitMs);
+  } else {
+    await bot.editMessageText(`✅ *Почасовой пакет завершён!*
+✓${job.doneSoFar} ✗${job.errorsSoFar}`, {
+      chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown"
+    }).catch(()=>{});
+    delete videoScheduler[chatId];
+    showMainMenu(chatId);
+  }
+}
+
 // ─── Локальный баланс (общий для всех) ───
 const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
 
@@ -232,13 +314,11 @@ async function showBalance(chatId, msgId = null) {
     [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
     [{ text: "◀️ Назад", callback_data: "close_balance" }],
   ]};
-  // Используем тот же msgId что и меню, чтобы не плодить сообщения
   const targetId = msgId || s.menuMsgId;
   if (targetId) {
     const ok = await bot.editMessageText(text, { chat_id: chatId, message_id: targetId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>null);
     if (ok) return;
   }
-  // Если редактировать нечего — удаляем старое и шлём новое
   if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); }
   const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
   s.menuMsgId = m.message_id;
@@ -286,13 +366,11 @@ async function showMainMenu(chatId) {
     [{ text: "📋 История", callback_data: "show_history" }],
   ]};
 
-  // Пробуем отредактировать существующее меню
   if (s.menuMsgId) {
     try {
       await bot.editMessageText(text, { chat_id: chatId, message_id: s.menuMsgId, parse_mode: "Markdown", reply_markup: kb });
       return;
     } catch(e) {
-      // Сообщение устарело — удаляем и создаём новое
       await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{});
       s.menuMsgId = null;
     }
@@ -523,7 +601,7 @@ bot.onText(/\/start|\/menu/, async (msg) => {
     await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{});
     s.menuMsgId = null;
   }
-  await bot.sendMessage(chatId, '⌨️ Готово! Используй кнопки ниже или меню:', { reply_markup: REPLY_KEYBOARD });
+  await bot.sendMessage(chatId, '⌨️ Клавиатура активирована!', { reply_markup: REPLY_KEYBOARD });
   showMainMenu(chatId);
 });
 
@@ -898,58 +976,46 @@ bot.on("message", async (msg) => {
   if (replyMap[msg.text]) {
     s.step = null;
     const action = replyMap[msg.text];
+    if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
     if (action === "show_balance") return showBalance(chatId);
     if (action === "open_imgmodel") {
       const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text:`${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_im_${k}` }]);
       rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-      // Удаляем старое меню и показываем новое
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
       const m = await bot.sendMessage(chatId, "🎨 *Модель изображения:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     if (action === "open_vidmodel") {
       const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text:`${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_vm_${k}` }]);
       rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
       const m = await bot.sendMessage(chatId, "🎥 *Модель видео:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     if (action === "do_image") {
       s.step="waiting_prompt"; s.tab="image"; s.mode="normal";
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
       const m = await bot.sendMessage(chatId, `🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     if (action === "do_image_ref") {
       s.pendingRefImages=[]; s.tab="image_ref"; s.mode="normal"; s.step="waiting_ref_photos";
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
-      const m = await bot.sendMessage(chatId, "🖼️📸 *Изображение из референсов*\n\nОтправь до 10 фото по одному.\nКогда добавишь все — нажми кнопку:", { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
-        [{ text:"✅ Референсы готовы, ввести промпт", callback_data:"ref_photos_done" }],
+      const m = await bot.sendMessage(chatId, "🖼️📸 *Фото из референсов*\n\nОтправь до 10 фото, затем нажми кнопку:", { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
+        [{ text:"✅ Готово, ввести промпт", callback_data:"ref_photos_done" }],
         [{ text:"❌ Отмена", callback_data:"back_menu" }],
       ]}});
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     if (action === "do_vtext") {
       s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal";
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
       const m = await bot.sendMessage(chatId, `🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     if (action === "do_vimage") {
       const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
       s.pendingRefImages=[]; s.tab="video_ref"; s.mode="normal"; s.step="waiting_vid_ref_photos";
-      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
       const m = await bot.sendMessage(chatId, `📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
         [{ text:"✅ Фото готовы, ввести промпт", callback_data:"vid_ref_photos_done" }],
         [{ text:"❌ Отмена", callback_data:"back_menu" }],
       ]}});
-      s.menuMsgId = m.message_id;
-      return;
+      s.menuMsgId = m.message_id; return;
     }
     return;
   }
@@ -975,10 +1041,12 @@ bot.on("message", async (msg) => {
   }
   if (s.step === "waiting_pg_apikey") {
     s.pgApiKey = msg.text.trim(); s.step = null; saveState(chatId);
+    await bot.sendMessage(chatId, "✅ API ключ сохранён!");
     return showPromptGenMenu(chatId);
   }
   if (s.step === "waiting_pg_template") {
     s.pgTemplate = msg.text; s.step = null; saveState(chatId);
+    await bot.sendMessage(chatId, "✅ Шаблон сохранён!");
     return showPromptGenMenu(chatId);
   }
   if (s.step === "waiting_pg_story") {
@@ -1015,12 +1083,26 @@ async function runNormal(chatId, s, prompt) {
   else { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
 
   const count = s.count;
-  const statusMsg = await bot.sendMessage(chatId, `⏳ Запускаю ${count} задач...\n🎨 ${model.label}\n💳 ${model.credits}`);
-  const tasks = Array.from({length:count}, (_,i) => genOne(chatId, s, prompt, endpoint, model, isImage, i+1, count));
-  await bot.editMessageText(`⏳ ${count} задач запущено...`, { chat_id: chatId, message_id: statusMsg.message_id });
-  const results = await Promise.allSettled(tasks);
-  const ok = results.filter(r=>r.status==="fulfilled").length;
-  await bot.editMessageText(`✅ Готово! ✓${ok}${count-ok>0?` ✗${count-ok}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
+  const queue = isImage ? imageQueue : videoQueue;
+  let done = 0, errors = 0;
+  const statusMsg = await bot.sendMessage(chatId,
+    `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
+    { parse_mode: "Markdown" });
+
+  const tasks = Array.from({length:count}, (_,i) =>
+    queue(() => genOne(chatId, s, prompt, endpoint, model, isImage, i+1, count))
+      .then(() => { done++; })
+      .catch(() => { errors++; })
+      .finally(() => {
+        bot.editMessageText(
+          `⏳ Прогресс: ✓${done}/${count}${errors>0?` ✗${errors}`:""}\n🎨 ${model.label}`,
+          { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+        ).catch(()=>{});
+      })
+  );
+
+  await Promise.allSettled(tasks);
+  await bot.editMessageText(`✅ Готово! ✓${done}${errors>0?` ✗${errors}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
   showMainMenu(chatId);
 }
 
@@ -1076,23 +1158,49 @@ async function runBatch(chatId) {
       tasks.push({ prompt: "animate", idx: `${prompts.length+fi+1}.${vi+1}`, ep: VIDEO_MODELS[s.vidModel].epI, isImg: false, fileId: photos[fi] });
 
   const total = tasks.length;
-  let done = 0, errors = 0;
-  const statusMsg = await bot.sendMessage(chatId, `📦 *Пакетный режим*\nЗадач: ${total} | ${model.label}\n💳 ${model.credits}`, { parse_mode: "Markdown" });
 
-  for (let i=0; i<tasks.length; i+=5) {
-    const batch = tasks.slice(i, i+5);
-    await Promise.allSettled(batch.map(async (task) => {
-      try {
-        await genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId);
-        done++;
-      } catch { errors++; }
-      await bot.editMessageText(
-        `📦 Пакет: ✓${done}/${total}${errors>0?` ✗${errors}`:""}`,
-        { chat_id: chatId, message_id: statusMsg.message_id }
-      ).catch(()=>{});
-    }));
+  if (!isImage && total > 15) {
+    // ── Почасовой режим для видео (пачки по 15)
+    videoScheduler[chatId] = {
+      tasks: [...tasks],
+      totalTasks: total,
+      doneSoFar: 0,
+      errorsSoFar: 0,
+      statusMsgId: null,
+      model, s,
+    };
+    await bot.sendMessage(chatId,
+      `⏰ *Почасовой видео-пакет запущен!*\n` +
+      `Всего задач: *${total}*\n` +
+      `Пачек по 15: *${Math.ceil(total/15)}*\n` +
+      `Параллельно: *10 потоков*\n\n` +
+      `Первая пачка стартует сейчас. Следующие — после сброса лимита каждый час.`,
+      { parse_mode: "Markdown" });
+    s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0;
+    scheduleVideoChunk(chatId);
+    return;
   }
 
+  // ── Обычный пакет (фото или видео ≤15)
+  const queue = isImage ? imageQueue : videoQueue;
+  let done = 0, errors = 0;
+  const statusMsg = await bot.sendMessage(chatId,
+    `📦 *Пакетный режим*\nЗадач: ${total} | ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
+    { parse_mode: "Markdown" });
+
+  const allTasks = tasks.map(task =>
+    queue(() => genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId))
+      .then(() => done++)
+      .catch(() => errors++)
+      .finally(() => {
+        bot.editMessageText(
+          `📦 Пакет: ✓${done}/${total}${errors>0?` ✗${errors}`:""}`,
+          { chat_id: chatId, message_id: statusMsg.message_id }
+        ).catch(()=>{});
+      })
+  );
+
+  await Promise.allSettled(allTasks);
   await bot.editMessageText(`✅ Пакет готов! ✓${done}${errors>0?` ✗${errors}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
   s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0;
   showMainMenu(chatId);
@@ -1169,10 +1277,35 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     const errDetail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error;
     const errStatus = e.response?.status ? `[${e.response.status}] ` : "";
     const errStr = errDetail ? (typeof errDetail === "object" ? JSON.stringify(errDetail) : String(errDetail)) : e.message;
-    console.log(`[genOne error] status=${e.response?.status} endpoint=${endpoint} errData=${JSON.stringify(e.response?.data).slice(0,500)} bodyKeys=${Object.keys(body).join(",")}`);
-    await bot.sendMessage(chatId, `❌ ${errStatus}${label?`[${label}] `:""}${errStr}`, {
-      reply_markup: { inline_keyboard: [[{ text:"🔄 Повторить", callback_data:`show_regen_0` }]] }
-    });
+
+    // Детальный лог в консоль
+    const logMsg = [
+      `[genOne ERROR]`,
+      `label=${label || "-"}`,
+      `status=${e.response?.status || "none"}`,
+      `endpoint=${endpoint}`,
+      `model=${model.label}`,
+      `prompt="${prompt.slice(0,80)}"`,
+      `bodyKeys=${Object.keys(body).join(",")}`,
+      `err="${errStr}"`,
+      `rawData=${JSON.stringify(e.response?.data || {}).slice(0,400)}`,
+    ].join(" | ");
+    console.error(logMsg);
+
+    // Сохраняем в историю для перегенерации даже при ошибке
+    addHistory(chatId, { index: label||"err", model: model.label, prompt, opId: "error", endpoint, body, isImage, ratio: s.ratio });
+    const errHistIdx = 0;
+
+    await bot.sendMessage(chatId,
+      `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n` +
+      `🤖 ${model.label}\n` +
+      `${errStatus ? `Код: \`${errStatus.trim()}\`\n` : ""}` +
+      `Причина: \`${errStr.slice(0,300)}\``,
+      {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${errHistIdx}` }]] }
+      }
+    );
     throw e;
   }
 }
