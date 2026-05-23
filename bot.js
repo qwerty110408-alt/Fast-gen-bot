@@ -11,6 +11,7 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 // ─── Персистентное состояние ──────────────
 const STATE_FILE = "./user_states.json";
 const BALANCE_FILE = "./balance_state.json";
+const HISTORY_FILE = "./history_state.json";
 
 function loadJSON(file, def) {
   try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return def; }
@@ -20,6 +21,7 @@ function saveJSON(file, data) {
 }
 
 const persistedStates = loadJSON(STATE_FILE, {});
+const persistedHistory = loadJSON(HISTORY_FILE, {});
 
 // ─── Очередь с ограничением параллельности ───
 function createQueue(concurrency) {
@@ -166,7 +168,8 @@ async function scheduleVideoChunk(chatId) {
     return;
   }
   const { tasks, model, s } = job;
-  const chunk = tasks.splice(0, 15); // берём до 15 задач
+  const hourlyLimit = job.hourlyLimit || 15;
+  const chunk = tasks.splice(0, hourlyLimit); // берём до hourlyLimit задач
   const total = job.totalTasks;
 
   const { ratio: jobRatio, resolution: jobRes } = job.s;
@@ -175,7 +178,7 @@ async function scheduleVideoChunk(chatId) {
     `🤖 ${model.label} | 📐 ${jobRatio}\n` +
     `Всего: ${total} | Осталось: ${job.tasks.length}\n` +
     `✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
-    `⚙️ Текущая пачка: ${chunk.length} задач`;
+    `⚙️ Текущая пачка: ${chunk.length} задач (лимит/час: ${hourlyLimit})`;
 
   if (!job.statusMsgId) {
     const m = await bot.sendMessage(chatId, statusText(), { parse_mode: "Markdown" });
@@ -344,6 +347,7 @@ const DEFAULT_STATE = () => ({
   batchType: "image",
   batchImgModel: null, batchVidModel: null,
   batchRatio: null, batchResolution: null,
+  batchHourlyLimit: 15,
   keyframeStart: null, keyframeEnd: null,
   fileId: null,
   pendingRefImages: [],
@@ -389,6 +393,7 @@ function saveState(chatId) {
     seed: s.seed, resolution: s.resolution, batchType: s.batchType,
     batchImgModel: s.batchImgModel, batchVidModel: s.batchVidModel,
     batchRatio: s.batchRatio, batchResolution: s.batchResolution,
+    batchHourlyLimit: s.batchHourlyLimit,
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
     enhanceMode: s.enhanceMode,
@@ -397,14 +402,22 @@ function saveState(chatId) {
 }
 
 function getHistory(chatId) {
-  if (!history[chatId]) history[chatId] = [];
-  return history[chatId];
+  const key = String(chatId);
+  if (!history[key]) {
+    history[key] = persistedHistory[key] || [];
+  }
+  return history[key];
 }
 
 function addHistory(chatId, entry) {
+  const key = String(chatId);
   const h = getHistory(chatId);
+  // Add timestamp
+  entry.ts = Date.now();
   h.unshift(entry);
   if (h.length > 50) h.pop();
+  persistedHistory[key] = h;
+  saveJSON(HISTORY_FILE, persistedHistory);
 }
 
 // ─── Медиа ────────────────────────────────
@@ -479,22 +492,38 @@ async function showBalance(chatId, msgId = null) {
 }
 
 // ─── История ──────────────────────────────
-function showHistoryMenu(chatId, msgId = null) {
+function showHistoryMenu(chatId, msgId = null, page = 0) {
   const h = getHistory(chatId);
   if (h.length === 0) {
     const text = "📭 История пуста.";
-    if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId }).catch(()=>{});
-    else bot.sendMessage(chatId, text);
+    if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: "◀️ Назад", callback_data: "open_misc" }]] } }).catch(()=>{});
+    else bot.sendMessage(chatId, text, { reply_markup: { inline_keyboard: [[{ text: "◀️ Назад", callback_data: "open_misc" }]] } });
     return;
   }
-  const rows = h.slice(0,10).map((item,i) => [{
-    text: `${item.index || i+1} | ${item.model.slice(0,15)} | ${item.prompt.slice(0,20)}`,
-    callback_data: `hist_${i}`
-  }]);
-  rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+  const PAGE_SIZE = 8;
+  const totalPages = Math.ceil(h.length / PAGE_SIZE);
+  const slice = h.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+  const rows = slice.map((item, i) => {
+    const realIdx = page * PAGE_SIZE + i;
+    const typeIcon = item.isImage ? "🖼" : "🎬";
+    const timeStr = item.ts ? new Date(item.ts).toLocaleTimeString("ru", { hour:"2-digit", minute:"2-digit" }) : "";
+    const label = `${typeIcon} ${timeStr} | ${item.model.slice(0,12)} | ${item.prompt.slice(0,18)}`;
+    return [{ text: label, callback_data: `hist_${realIdx}` }];
+  });
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: "◀️", callback_data: `hist_page_${page - 1}` });
+  navRow.push({ text: `${page + 1}/${totalPages}`, callback_data: "noop" });
+  if (page < totalPages - 1) navRow.push({ text: "▶️", callback_data: `hist_page_${page + 1}` });
+
+  rows.push(navRow);
+  rows.push([{ text: "🗑 Очистить историю", callback_data: "hist_clear" }, { text: "◀️ Назад", callback_data: "open_misc" }]);
+
   const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
-  if (msgId) bot.editMessageText("📋 *История:*", { chat_id: chatId, message_id: msgId, ...opts }).catch(()=>{});
-  else bot.sendMessage(chatId, "📋 *История:*", opts);
+  const text = `📋 *История запросов* (${h.length}):\n_Тап на запись — детали и перегенерация_`;
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }).catch(()=>{});
+  else bot.sendMessage(chatId, text, opts);
 }
 
 // ─── Главное меню ─────────────────────────
@@ -512,15 +541,10 @@ async function showMainMenu(chatId) {
   const kb = { inline_keyboard: [
     [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "do_image_ref" }],
     [{ text: "🎬 Видео из текста", callback_data: "do_vtext" }, { text: "📸 Видео из фото", callback_data: "do_vimage" }],
-    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }, { text: "🎨 Remix", callback_data: "do_remix" }],
     [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
     [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
     [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
-    [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
-    ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
-    [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
-    [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
-    [{ text: "📋 История", callback_data: "show_history" }],
+    [{ text: "📊 Баланс", callback_data: "show_balance" }, { text: "⚙️ Прочее", callback_data: "open_misc" }],
   ]};
 
   if (s.menuMsgId) {
@@ -534,6 +558,25 @@ async function showMainMenu(chatId) {
   }
   const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
   s.menuMsgId = m.message_id;
+}
+
+// ─── Меню «Прочее» ────────────────────────
+function showMiscMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const enhanceLabel = { always: "✨ Всегда", never: "⏭ Никогда", ask: "❓ Спрашивать" }[s.enhanceMode || "ask"];
+  const seedLabel = s.seed === "fixed" ? "🌱 Seed: Фикс." : "🌱 Seed: Случ.";
+  const text = `⚙️ *Прочее*`;
+  const kb = { inline_keyboard: [
+    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }, { text: "🎨 Remix", callback_data: "do_remix" }],
+    [{ text: seedLabel, callback_data: "open_seed" }],
+    ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+    [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
+    [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
+    [{ text: "📋 История запросов", callback_data: "show_history" }],
+    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 
@@ -665,6 +708,7 @@ function showBatchMenu(chatId, msgId = null) {
     `📝 Промптов: *${prompts.length}/${MAX_PROMPTS}*\n` +
     (isVideoImage ? `📸 Фото: *${photos.length}*\n` : "") +
     `🔢 На 1 промпт/фото: *${s.perPrompt}* вар.\n` +
+    (!isImage ? `⏱ Лимит видео/час: *${s.batchHourlyLimit || 15}*\n` : "") +
     `Всего задач: *${totalTasks}*\n\n` +
     (currentPrompt ? `*Промпт ${idx+1}/${prompts.length}:*\n${currentPrompt}` : "_Промптов нет_");
 
@@ -681,6 +725,7 @@ function showBatchMenu(chatId, msgId = null) {
     [{ text: "✏️ Добавить промпты", callback_data: "batch_add_text" }, { text: "📄 Из файла .txt", callback_data: "batch_from_file" }],
     ...(isVideoImage ? [[{ text: "📸 Фото управление", callback_data: "batch_photos_menu" }]] : []),
     [{ text: `🔢 На 1 промпт: ${s.perPrompt}`, callback_data: "batch_per_prompt" }],
+    ...(!isImage ? [[{ text: `⏱ Лимит видео/час: ${s.batchHourlyLimit || 15}`, callback_data: "batch_hourly_limit" }]] : []),
     [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
     [{ text: "🗑 Очистить всё", callback_data: "batch_clear" }, { text: "❌ Отмена", callback_data: "back_menu" }],
   ]};
@@ -956,7 +1001,19 @@ bot.on("callback_query", async (query) => {
   if (data === "close_balance") { s.menuMsgId = msgId; return showMainMenu(chatId); }
   if (data === "show_balance")   { s.menuMsgId = msgId; return showBalance(chatId, msgId); }
   if (data === "refresh_balance") { return showBalance(chatId, msgId); }
-  if (data === "show_history")   { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId); }
+  if (data === "open_misc")      { s.menuMsgId = msgId; return showMiscMenu(chatId, msgId); }
+  if (data === "show_history")   { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId, 0); }
+  if (data.startsWith("hist_page_")) {
+    const pg = parseInt(data.replace("hist_page_",""));
+    return showHistoryMenu(chatId, msgId, pg);
+  }
+  if (data === "hist_clear") {
+    const key = String(chatId);
+    history[key] = [];
+    persistedHistory[key] = [];
+    saveJSON(HISTORY_FILE, persistedHistory);
+    return showHistoryMenu(chatId, msgId, 0);
+  }
 
   // ── История
   if (data.startsWith("hist_")) {
@@ -964,11 +1021,17 @@ bot.on("callback_query", async (query) => {
     const h = getHistory(chatId);
     const item = h[idx];
     if (!item) return;
+    const timeStr = item.ts ? new Date(item.ts).toLocaleString("ru") : "—";
+    const typeIcon = item.isImage ? "🖼" : "🎬";
     return edit(
-      `📋 *Запись ${idx+1}*\n\n🤖 ${item.model}\n📝 _${item.prompt}_\n\n🔑 ID: \`${item.opId}\``,
+      `📋 *Запись ${idx+1}*\n\n` +
+      `${typeIcon} *${item.model}*\n` +
+      `🕐 ${timeStr}\n` +
+      `📝 _${item.prompt}_\n\n` +
+      `🔑 ID: \`${item.opId}\``,
       { inline_keyboard: [
         [{ text: "🔄 Перегенерировать", callback_data: `show_regen_${idx}` }],
-        [{ text: "◀️ Назад", callback_data: "show_history" }],
+        [{ text: "◀️ Назад к истории", callback_data: "show_history" }],
       ]}
     );
   }
@@ -1086,6 +1149,29 @@ bot.on("callback_query", async (query) => {
     ]});
   }
   if (data.startsWith("set_pp_")) { s.perPrompt=parseInt(data.replace("set_pp_","")); return showBatchMenu(chatId, msgId); }
+
+  if (data === "batch_hourly_limit") {
+    const cur = s.batchHourlyLimit || 15;
+    return edit(
+      `⏱ *Лимит видео в час*\n\nСейчас: *${cur}*\n\nСколько видео генерировать за один час?\n(Потом бот автоматически ждёт сброса лимита)`,
+      { inline_keyboard: [
+        [5, 10, 15, 20].map(n => ({ text: cur===n?`✅ ${n}`:`${n}`, callback_data:`set_hl_${n}` })),
+        [25, 30, 40, 50].map(n => ({ text: cur===n?`✅ ${n}`:`${n}`, callback_data:`set_hl_${n}` })),
+        [{ text: "✏️ Ввести своё число", callback_data: "set_hl_custom" }],
+        [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
+      ]}
+    );
+  }
+  if (data.startsWith("set_hl_")) {
+    const val = data.replace("set_hl_","");
+    if (val === "custom") {
+      s.step = "waiting_hourly_limit";
+      return edit("⏱ Введи число видео в час (1–500):", { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "do_batch_menu" }]] });
+    }
+    s.batchHourlyLimit = parseInt(val);
+    saveState(chatId);
+    return showBatchMenu(chatId, msgId);
+  }
   if (data === "batch_clear") { s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0; return showBatchMenu(chatId, msgId); }
   if (data === "batch_run") { del(); return runBatch(chatId); }
 
@@ -1497,6 +1583,13 @@ bot.on("message", async (msg) => {
     s.count = n; s.step = null; saveState(chatId);
     return showMainMenu(chatId);
   }
+  if (s.step === "waiting_hourly_limit") {
+    const n = parseInt(msg.text);
+    if (isNaN(n) || n < 1 || n > 500) return bot.sendMessage(chatId, "❌ Введи число от 1 до 500:");
+    s.batchHourlyLimit = n; s.step = null; saveState(chatId);
+    await bot.sendMessage(chatId, `✅ Лимит видео/час установлен: *${n}*`, { parse_mode: "Markdown" });
+    return showBatchMenu(chatId);
+  }
   if (s.step === "waiting_batch_prompts") {
     s.step = null;
     const bt = s.batchType || "image";
@@ -1758,21 +1851,24 @@ async function runBatch(chatId) {
   }
 
   const total = tasks.length;
+  const hourlyLimit = s.batchHourlyLimit || 15;
 
-  if (!isImage && total > 15) {
-    // ── Почасовой режим для видео (пачки по 15)
+  if (!isImage && total > hourlyLimit) {
+    // ── Почасовой режим для видео (пачки по hourlyLimit)
     videoScheduler[chatId] = {
       tasks: [...tasks],
       totalTasks: total,
       doneSoFar: 0,
       errorsSoFar: 0,
       statusMsgId: null,
+      hourlyLimit,
       model, s: batchS,
     };
     await bot.sendMessage(chatId,
       `⏰ *Почасовой видео-пакет запущен!*\n` +
       `Всего задач: *${total}*\n` +
-      `Пачек по 15: *${Math.ceil(total/15)}*\n` +
+      `Лимит в час: *${hourlyLimit}*\n` +
+      `Пачек: *${Math.ceil(total/hourlyLimit)}*\n` +
       `Параллельно: *10 потоков*\n\n` +
       `Первая пачка стартует сейчас. Следующие — после сброса лимита каждый час.`,
       { parse_mode: "Markdown" });
