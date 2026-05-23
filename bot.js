@@ -104,11 +104,11 @@ const IMAGE_MODELS = {
 };
 
 const VIDEO_MODELS = {
-  "veo31_fast":    { label: "Veo 3.1 Fast",    epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-fast",    credits: "1 кред = 1 видео",   cost: 1 },
-  "veo31_light":   { label: "Veo 3.1 Light",   epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-light",   credits: "1 кред = 1 видео",   cost: 1 },
-  "veo31_quality": { label: "Veo 3.1 Quality", epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-quality", credits: "10 кред = 1 видео ⚠️", cost: 10 },
-  "grok_vid":      { label: "Grok Video",       epT: "/api/v4/grok/video/from-text",   epI: "/api/v4/grok/video/from-image",   credits: "1 кред = 1 видео",   cost: 1, res: true, defaultRes: "720p" },
-  "veo31_flower":  { label: "Veo 3.1 Flower",  epT: "/api/v4/flower/video/from-text", epI: "/api/v4/flower/video/from-image", credits: "1 кред = 1 видео",   cost: 1 },
+  "veo31_fast":    { label: "Veo 3.1 Fast",    epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-ingredients",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-fast",    credits: "1 кред = 1 видео",   cost: 1 },
+  "veo31_light":   { label: "Veo 3.1 Light",   epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-ingredients",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-light",   credits: "1 кред = 1 видео",   cost: 1 },
+  "veo31_quality": { label: "Veo 3.1 Quality", epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-ingredients",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-quality", credits: "10 кред = 1 видео ⚠️", cost: 10 },
+  "grok_vid":      { label: "Grok Video",       epT: "/api/v4/grok/video/from-text",   epI: "/api/v4/grok/video/from-image",         credits: "1 кред = 1 видео",   cost: 1, res: true, defaultRes: "720p" },
+  "veo31_flower":  { label: "Veo 3.1 Flower",  epT: "/api/v4/flower/video/from-text", epI: "/api/v4/flower/video/from-image",       credits: "1 кред = 1 видео",   cost: 1 },
 };
 
 const RATIOS = ["16:9","9:16","1:1","4:3","3:4","3:2","2:3"];
@@ -986,8 +986,10 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     }
   } catch(e) {
     const errDetail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error;
+    const errStatus = e.response?.status ? `[${e.response.status}] ` : "";
     const errStr = errDetail ? (typeof errDetail === "object" ? JSON.stringify(errDetail) : String(errDetail)) : e.message;
-    await bot.sendMessage(chatId, `❌ ${label?`[${label}] `:""}${errStr}`, {
+    console.log(`[genOne error] status=${e.response?.status} endpoint=${endpoint} body=${JSON.stringify(e.response?.data).slice(0,300)}`);
+    await bot.sendMessage(chatId, `❌ ${errStatus}${label?`[${label}] `:""}${errStr}`, {
       reply_markup: { inline_keyboard: [[{ text:"🔄 Повторить", callback_data:`show_regen_0` }]] }
     });
     throw e;
