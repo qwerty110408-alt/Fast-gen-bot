@@ -226,17 +226,22 @@ async function pollResult(opId, max=36, interval=10000) {
 
 // ─── Баланс UI ────────────────────────────
 async function showBalance(chatId, msgId = null) {
+  const s = getState(chatId);
   const text = formatBalance();
   const kb = { inline_keyboard: [
     [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
     [{ text: "◀️ Назад", callback_data: "close_balance" }],
   ]};
-  if (msgId) {
-    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  } else {
-    const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-    getState(chatId).balanceMsgId = m.message_id;
+  // Используем тот же msgId что и меню, чтобы не плодить сообщения
+  const targetId = msgId || s.menuMsgId;
+  if (targetId) {
+    const ok = await bot.editMessageText(text, { chat_id: chatId, message_id: targetId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>null);
+    if (ok) return;
   }
+  // Если редактировать нечего — удаляем старое и шлём новое
+  if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); }
+  const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+  s.menuMsgId = m.message_id;
 }
 
 // ─── История ──────────────────────────────
@@ -281,11 +286,16 @@ async function showMainMenu(chatId) {
     [{ text: "📋 История", callback_data: "show_history" }],
   ]};
 
+  // Пробуем отредактировать существующее меню
   if (s.menuMsgId) {
     try {
       await bot.editMessageText(text, { chat_id: chatId, message_id: s.menuMsgId, parse_mode: "Markdown", reply_markup: kb });
       return;
-    } catch {}
+    } catch(e) {
+      // Сообщение устарело — удаляем и создаём новое
+      await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{});
+      s.menuMsgId = null;
+    }
   }
   const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
   s.menuMsgId = m.message_id;
@@ -493,23 +503,27 @@ async function runPromptGen(chatId, storyText) {
   showBatchMenu(chatId);
 }
 
-// ─── Reply Keyboard (постоянная клавиатура) ───
+// ─── Reply Keyboard ──────────────────────
 const REPLY_KEYBOARD = {
   keyboard: [
-    [{ text: "🖼️ Изображение" }, { text: "🖼️📸 Фото из рефов" }],
-    [{ text: "🎬 Видео из текста" }, { text: "📸 Видео из фото" }],
-    [{ text: "🎨 Модель фото" },    { text: "🎥 Модель видео" }],
-    [{ text: "📊 Баланс" }],
+    [{ text: '🖼️ Изображение' }, { text: '🖼️📸 Фото из рефов' }],
+    [{ text: '🎬 Видео из текста' }, { text: '📸 Видео из фото' }],
+    [{ text: '🎨 Модель фото' }, { text: '🎥 Модель видео' }],
+    [{ text: '📊 Баланс' }],
   ],
   resize_keyboard: true,
   persistent: true,
 };
 
 // ─── /start /menu ─────────────────────────
-bot.onText(/\/start|\/menu/, (msg) => {
+bot.onText(/\/start|\/menu/, async (msg) => {
   const chatId = msg.chat.id;
-  getState(chatId); // инициализация
-  bot.sendMessage(chatId, "⌨️ Клавиатура активирована!", { reply_markup: REPLY_KEYBOARD });
+  const s = getState(chatId);
+  if (s.menuMsgId) {
+    await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{});
+    s.menuMsgId = null;
+  }
+  await bot.sendMessage(chatId, '⌨️ Готово! Используй кнопки ниже или меню:', { reply_markup: REPLY_KEYBOARD });
   showMainMenu(chatId);
 });
 
@@ -536,10 +550,10 @@ bot.on("callback_query", async (query) => {
 
   if (data === "noop") return;
   if (data === "back_menu" || data === "cancel") { s.step = null; del(); return showMainMenu(chatId); }
-  if (data === "close_balance") { return bot.deleteMessage(chatId, msgId).catch(()=>{}); }
-  if (data === "show_balance")   { return showBalance(chatId); }
+  if (data === "close_balance") { s.menuMsgId = msgId; return showMainMenu(chatId); }
+  if (data === "show_balance")   { s.menuMsgId = msgId; return showBalance(chatId, msgId); }
   if (data === "refresh_balance") { return showBalance(chatId, msgId); }
-  if (data === "show_history")   { del(); return showHistoryMenu(chatId); }
+  if (data === "show_history")   { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId); }
 
   // ── История
   if (data.startsWith("hist_")) {
@@ -871,7 +885,7 @@ bot.on("message", async (msg) => {
   const s = getState(chatId);
   if (!msg.text || msg.text.startsWith("/")) return;
 
-  // ── Кнопки Reply Keyboard
+  // ── Reply Keyboard кнопки
   const replyMap = {
     "🖼️ Изображение":     "do_image",
     "🖼️📸 Фото из рефов": "do_image_ref",
@@ -888,35 +902,54 @@ bot.on("message", async (msg) => {
     if (action === "open_imgmodel") {
       const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text:`${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_im_${k}` }]);
       rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-      return bot.sendMessage(chatId, "🎨 *Модель изображения:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+      // Удаляем старое меню и показываем новое
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, "🎨 *Модель изображения:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+      s.menuMsgId = m.message_id;
+      return;
     }
     if (action === "open_vidmodel") {
       const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text:`${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_vm_${k}` }]);
       rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-      return bot.sendMessage(chatId, "🎥 *Модель видео:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, "🎥 *Модель видео:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+      s.menuMsgId = m.message_id;
+      return;
     }
     if (action === "do_image") {
       s.step="waiting_prompt"; s.tab="image"; s.mode="normal";
-      return bot.sendMessage(chatId, `🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, `🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+      s.menuMsgId = m.message_id;
+      return;
     }
     if (action === "do_image_ref") {
       s.pendingRefImages=[]; s.tab="image_ref"; s.mode="normal"; s.step="waiting_ref_photos";
-      return bot.sendMessage(chatId, "🖼️📸 *Изображение из референсов*\n\nОтправь до 10 фото по одному.\nКогда добавишь все — нажми кнопку:", { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, "🖼️📸 *Изображение из референсов*\n\nОтправь до 10 фото по одному.\nКогда добавишь все — нажми кнопку:", { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
         [{ text:"✅ Референсы готовы, ввести промпт", callback_data:"ref_photos_done" }],
         [{ text:"❌ Отмена", callback_data:"back_menu" }],
       ]}});
+      s.menuMsgId = m.message_id;
+      return;
     }
     if (action === "do_vtext") {
       s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal";
-      return bot.sendMessage(chatId, `🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, `🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+      s.menuMsgId = m.message_id;
+      return;
     }
     if (action === "do_vimage") {
       const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
       s.pendingRefImages=[]; s.tab="video_ref"; s.mode="normal"; s.step="waiting_vid_ref_photos";
-      return bot.sendMessage(chatId, `📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
+      if (s.menuMsgId) { await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{}); s.menuMsgId = null; }
+      const m = await bot.sendMessage(chatId, `📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
         [{ text:"✅ Фото готовы, ввести промпт", callback_data:"vid_ref_photos_done" }],
         [{ text:"❌ Отмена", callback_data:"back_menu" }],
       ]}});
+      s.menuMsgId = m.message_id;
+      return;
     }
     return;
   }
@@ -925,7 +958,6 @@ bot.on("message", async (msg) => {
     const n = parseInt(msg.text);
     if (isNaN(n) || n < 1 || n > 500) return bot.sendMessage(chatId, "❌ Введи число от 1 до 500:");
     s.count = n; s.step = null; saveState(chatId);
-    await bot.sendMessage(chatId, `✅ Количество: *${n}*`, { parse_mode: "Markdown" });
     return showMainMenu(chatId);
   }
   if (s.step === "waiting_batch_prompts") {
@@ -943,12 +975,10 @@ bot.on("message", async (msg) => {
   }
   if (s.step === "waiting_pg_apikey") {
     s.pgApiKey = msg.text.trim(); s.step = null; saveState(chatId);
-    await bot.sendMessage(chatId, "✅ API ключ сохранён!");
     return showPromptGenMenu(chatId);
   }
   if (s.step === "waiting_pg_template") {
     s.pgTemplate = msg.text; s.step = null; saveState(chatId);
-    await bot.sendMessage(chatId, "✅ Шаблон сохранён!");
     return showPromptGenMenu(chatId);
   }
   if (s.step === "waiting_pg_story") {
@@ -967,7 +997,7 @@ bot.on("message", async (msg) => {
     return runRegenItem(chatId, newItem, newItem.endpoint, newItem.isImage);
   }
 
-  if (s.step !== "waiting_prompt") return bot.sendMessage(chatId, "Нажми /menu чтобы начать.");
+  if (s.step !== "waiting_prompt") return showMainMenu(chatId);
 
   const prompt = msg.text;
   s.step = null;
