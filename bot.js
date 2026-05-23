@@ -127,6 +127,19 @@ async function getUsageData() {
   return null;
 }
 
+function getVal(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "object") return v.used ?? v.count ?? v.value ?? v.current ?? null;
+  return v;
+}
+function getLim(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "object") return v.limit ?? v.max ?? v.total ?? v.allowed ?? null;
+  return v;
+}
+
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс";
 
@@ -135,25 +148,27 @@ function formatBalance(usage) {
   const win    = usage.usagewindow   || usage.usage_window  || {};
   const hourly = cur.hourlyusage     || cur.hourly_usage    || cur;
 
-  // Exact field names confirmed from debug:
-  // hourly: image_generation, video_generation, prompt_generation, flow_ultra_generation
-  // lim: img_gen_per_hour_limit, video_gen_per_hour_limit,
-  //      img_generation_threads_allowed, video_generation_threads_allowed,
-  //      prompt_tokens_per_hour_limit, flow_ultra_hour_limit, flow_ultra_threads_allowed
+  // image_generation and video_generation may be objects {used, limit} or plain numbers
+  const imgRaw = hourly.image_generation;
+  const vidRaw = hourly.video_generation;
+  const thrRaw = cur.activethreads ?? cur.active_threads;
 
-  const imgUsed  = hourly.image_generation  ?? "?";
-  const imgTotal = lim.img_gen_per_hour_limit ?? "?";
-  const vidUsed  = hourly.video_generation  ?? "?";
-  const vidTotal = lim.video_gen_per_hour_limit ?? "?";
-  const tokUsed  = hourly.prompt_generation ?? null;
-  const tokTotal = lim.prompt_tokens_per_hour_limit ?? null;
-  const threads    = cur.activethreads ?? cur.active_threads ?? null;
-  const imgThreads = lim.img_generation_threads_allowed   ?? null;
-  const vidThreads = lim.video_generation_threads_allowed ?? null;
+  const imgUsed  = getVal(imgRaw) ?? "?";
+  const imgTotal = getLim(imgRaw) ?? lim.img_gen_per_hour_limit ?? "?";
+  const vidUsed  = getVal(vidRaw) ?? "?";
+  const vidTotal = getLim(vidRaw) ?? lim.video_gen_per_hour_limit ?? "?";
+
+  const tokRaw   = hourly.prompt_generation;
+  const tokUsed  = getVal(tokRaw);
+  const tokTotal = getLim(tokRaw) ?? lim.prompt_tokens_per_hour_limit ?? null;
+
+  const threads    = getVal(thrRaw);
+  const imgThreads = getLim(thrRaw) ?? lim.img_generation_threads_allowed ?? lim.image_generation_threads_allowed ?? null;
+  const vidThreads = lim.video_generation_threads_allowed ?? lim.videogenerationthreadsallowed ?? null;
 
   // Reset time
-  const resetMin   = win.reset_in_minutes ?? win.reset_in ?? usage.reset_in_minutes ?? null;
-  const resetAtRaw = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
+  const resetMin   = win.reset_in_minutes ?? win.reset_in ?? win.minutes_remaining ?? usage.reset_in_minutes ?? null;
+  const resetAtRaw = win.reset_at ?? win.resets_at ?? win.next_reset ?? usage.reset_at ?? null;
   let resetStr = "?";
   if (resetMin != null) {
     resetStr = `${Math.floor(resetMin)}м`;
@@ -163,16 +178,21 @@ function formatBalance(usage) {
   }
 
   const tokLine    = tokUsed  != null ? `💬 Токены: ${tokUsed}/${tokTotal ?? "?"}\n` : "";
-  const threadLine = threads  != null
-    ? `🔄 Потоки: 🖼 ${threads}/${imgThreads ?? "?"} | 🎬 ${threads}/${vidThreads ?? "?"}\n`
-    : (imgThreads != null ? `🔄 Потоки: 🖼 ?/${imgThreads} | 🎬 ?/${vidThreads ?? "?"}\n` : "");
+  const threadLine = (threads != null || imgThreads != null)
+    ? `🔄 Потоки: 🖼 ${threads ?? "?"}/${imgThreads ?? "?"} | 🎬 ${threads ?? "?"}/${vidThreads ?? "?"}\n`
+    : "";
+
+  // Debug win if reset still unknown
+  const winDebug = resetStr === "?" && Object.keys(win).length > 0
+    ? `\n[win: ${Object.keys(win).join(", ")}]\n` : "";
 
   return (
     `📊 Баланс и лимиты\n\n` +
     `🖼 Изображения: ${imgUsed}/${imgTotal}\n` +
     `🎬 Видео: ${vidUsed}/${vidTotal}\n` +
     tokLine + threadLine +
-    `⏱ Сброс через: ${resetStr}\n\n` +
+    `⏱ Сброс через: ${resetStr}\n` +
+    winDebug + `\n` +
     `Стоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
