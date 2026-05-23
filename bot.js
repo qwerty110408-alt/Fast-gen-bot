@@ -1300,22 +1300,22 @@ bot.on("photo", async (msg) => {
   if (s.mode === "batch") {
     const bt = s.batchType || "image";
     if (bt === "video_image") {
-      if (s.batchPhotos.length >= 100)
-        return bot.sendMessage(chatId, `❌ Максимум 100 фото в пакете!`);
+      if (s.batchPhotos.length >= 500)
+        return bot.sendMessage(chatId, `❌ Максимум 500 фото в пакете!`);
       s.batchPhotos.push(fileId);
       // Если это альбом — дебаунсим сообщение
       if (msg.media_group_id) {
         if (mediaGroupTimers.has(msg.media_group_id)) clearTimeout(mediaGroupTimers.get(msg.media_group_id));
         const t = setTimeout(() => {
           mediaGroupTimers.delete(msg.media_group_id);
-          bot.sendMessage(chatId, `✅ Фото добавлены! Всего: ${s.batchPhotos.length}/100 фото, ${s.batchPrompts.length} промптов`, {
+          bot.sendMessage(chatId, `✅ Фото добавлены! Всего: ${s.batchPhotos.length}/500 фото, ${s.batchPrompts.length} промптов`, {
             reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch_menu" }],[{ text:"🚀 Генерировать!", callback_data:"batch_run" }]] }
           });
         }, 1500);
         mediaGroupTimers.set(msg.media_group_id, t);
         return;
       }
-      return bot.sendMessage(chatId, `✅ Фото добавлено! Всего: ${s.batchPhotos.length}/100 фото, ${s.batchPrompts.length} промптов`, {
+      return bot.sendMessage(chatId, `✅ Фото добавлено! Всего: ${s.batchPhotos.length}/500 фото, ${s.batchPrompts.length} промптов`, {
         reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch_menu" }],[{ text:"🚀 Генерировать!", callback_data:"batch_run" }]] }
       });
     } else {
@@ -1722,41 +1722,6 @@ async function runRemix(chatId, s, prompt) {
   showMainMenu(chatId);
 }
 
-// ─── Очередь отправки для порядка результатов ─
-function createOrderedSendQueue() {
-  // Возвращает функцию registerSlot(index) => { resolve(sendFn) }
-  // sendFn вызовется строго по порядку index=0,1,2...
-  const slots = new Map();
-  let nextSend = 0;
-  let resolve_next = null;
-
-  async function drainLoop() {
-    while (true) {
-      if (slots.has(nextSend)) {
-        const fn = slots.get(nextSend);
-        slots.delete(nextSend);
-        nextSend++;
-        try { await fn(); } catch(e) { console.error("[orderedSend]", e.message); }
-      } else {
-        await new Promise(r => { resolve_next = r; });
-        resolve_next = null;
-      }
-    }
-  }
-  drainLoop();
-
-  return function slot(index) {
-    return new Promise(res => {
-      // Когда задача готова, она вызывает resolve со своей функцией отправки
-      const setFn = (fn) => {
-        slots.set(index, fn);
-        if (resolve_next) resolve_next();
-      };
-      res(setFn);
-    });
-  };
-}
-
 // ─── Пакетная генерация ───────────────────
 async function runBatch(chatId) {
   const s = getState(chatId);
@@ -1825,12 +1790,8 @@ async function runBatch(chatId) {
     `📦 *Пакетный режим*\n${typeLabel} | Задач: ${total}\n🤖 ${model.label} | 📐 ${ratio}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
     { parse_mode: "Markdown" });
 
-  // Очередь для отправки результатов в порядке промптов
-  const orderedSend = createOrderedSendQueue();
-
-  const allTasks = tasks.map((task, taskIndex) => {
-    const orderIdx = taskIndex;
-    return queue(() => genOne(chatId, batchS, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId, orderedSend ? orderedSend(orderIdx) : null))
+  const allTasks = tasks.map((task) => {
+    return queue(() => genOne(chatId, batchS, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId))
       .then(() => { done++; })
       .catch((e) => {
         errors++;
@@ -1862,10 +1823,8 @@ async function runBatch(chatId) {
 }
 
 // ─── Одна задача ──────────────────────────
-async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx=null, overrideFileId=null, orderedSendSlotPromise=null) {
+async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx=null, overrideFileId=null) {
   const label = batchIdx || (total>1 ? `${index}/${total}` : "");
-  // Получаем слот для упорядоченной отправки если передан
-  const setOrderedFn = orderedSendSlotPromise ? await orderedSendSlotPromise : null;
   try {
     const body = {
       prompt, aspect_ratio: s.ratio,
@@ -1924,17 +1883,11 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     const regenKb = { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${histIdx}` }]] };
 
     if (result) {
-      const sendFn = async () => { await sendMedia(chatId, result, isImage, caption, regenKb); };
-      if (setOrderedFn) setOrderedFn(sendFn);
-      else await sendFn();
+      await sendMedia(chatId, result, isImage, caption, regenKb);
     } else {
-      const sendFn = async () => {
-        await bot.sendMessage(chatId, `⏰ ${idxStr}не успело.\nID: \`${opId}\``, {
-          parse_mode: "Markdown", reply_markup: regenKb
-        });
-      };
-      if (setOrderedFn) setOrderedFn(sendFn);
-      else await sendFn();
+      await bot.sendMessage(chatId, `⏰ ${idxStr}не успело.\nID: \`${opId}\``, {
+        parse_mode: "Markdown", reply_markup: regenKb
+      });
     }
   } catch(e) {
     const errDetail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error;
@@ -1969,8 +1922,6 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
         reply_markup: { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${errHistIdx}` }]] }
       }
     );
-    // Закрываем слот чтобы очередь не зависала
-    if (setOrderedFn) setOrderedFn(async () => {});
     throw e;
   }
 }
