@@ -102,53 +102,79 @@ async function pollResult(opId, max=36, interval=10000) {
 
 // ─── Баланс ───────────────────────────────
 async function getUsageData() {
-  try {
-    const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
-      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
-    });
-    console.log("[balance raw]", JSON.stringify(data).slice(0, 300));
-    return data;
-  } catch(e) { console.error("[balance error]", e.message); return null; }
+  // Try different known endpoints
+  const endpoints = [
+    "/api/v5/usage",
+    "/api/v4/usage",
+    "/api/v5/user/usage",
+    "/api/v5/limits",
+    "/api/v4/limits",
+  ];
+  for (const ep of endpoints) {
+    try {
+      const { data } = await axios.get(`${BASE_URL}${ep}`, {
+        headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
+      });
+      console.log(`[balance OK] endpoint=${ep} data=`, JSON.stringify(data).slice(0, 500));
+      return data;
+    } catch(e) {
+      console.log(`[balance FAIL] endpoint=${ep} status=${e.response?.status} msg=${e.message}`);
+    }
+  }
+  return null;
 }
 
 function formatBalance(usage) {
-  if (!usage) return "❌ Не удалось получить баланс";
+  if (!usage) return "❌ Не удалось получить баланс\n\n_Проверь API ключ или попробуй позже_";
 
-  // API v5 returns credits-based fields; support multiple field name variants
-  const credUsed  = usage.credits_used   ?? usage.used_credits   ?? usage.images_used  ?? "?";
-  const credTotal = usage.credits_limit  ?? usage.total_credits  ?? usage.images_limit ?? "?";
-  const credLeft  = usage.credits_left   ?? usage.remaining_credits ??
-                    (credTotal !== "?" && credUsed !== "?" ? credTotal - credUsed : "?");
+  // Flatten nested objects (some APIs wrap in {data: {...}} or {usage: {...}})
+  const u = usage.data || usage.usage || usage.limits || usage;
 
-  const imgUsed   = usage.images_used    ?? usage.image_count    ?? "?";
-  const imgTotal  = usage.images_limit   ?? usage.image_limit    ?? "?";
-  const vidUsed   = usage.videos_used    ?? usage.video_count    ?? "?";
-  const vidTotal  = usage.videos_limit   ?? usage.video_limit    ?? "?";
+  // Images
+  const imgUsed  = u.images_used   ?? u.image_used   ?? u.images?.used   ?? "?";
+  const imgTotal = u.images_limit  ?? u.image_limit  ?? u.images?.limit  ??
+                   u.images_total  ?? u.image_total  ?? "?";
 
-  const streams    = usage.active_threads ?? usage.concurrent_tasks ?? usage.streams ?? "?";
-  const maxStreams  = usage.max_threads    ?? usage.max_concurrent  ?? usage.max_streams ?? "?";
+  // Videos
+  const vidUsed  = u.videos_used   ?? u.video_used   ?? u.videos?.used   ?? "?";
+  const vidTotal = u.videos_limit  ?? u.video_limit  ?? u.videos?.limit  ??
+                   u.videos_total  ?? u.video_total  ?? "?";
 
-  const resetIn = usage.reset_in_minutes != null
-    ? `${Math.floor(usage.reset_in_minutes)}м`
-    : (usage.reset_in_seconds != null ? `${Math.floor(usage.reset_in_seconds/60)}м` : "?");
-  const resetAt = usage.reset_at
-    ? new Date(usage.reset_at).toLocaleTimeString("ru")
-    : "?";
+  // Prompt tokens
+  const tokUsed  = u.prompt_tokens_used  ?? u.tokens_used  ?? u.prompts?.used  ?? null;
+  const tokTotal = u.prompt_tokens_limit ?? u.tokens_limit ?? u.prompts?.limit ?? null;
 
-  // Build lines only for fields we actually have
-  const imgLine = (imgUsed !== "?" || imgTotal !== "?")
-    ? `🖼 Изображения: *${imgUsed}/${imgTotal}* за час\n` : "";
-  const vidLine = (vidUsed !== "?" || vidTotal !== "?")
-    ? `🎬 Видео: *${vidUsed}/${vidTotal}* за час\n` : "";
-  const credLine = (credLeft !== "?" || credTotal !== "?")
-    ? `💳 Кредиты: *${credLeft}/${credTotal}* осталось\n` : "";
-  const streamsLine = (streams !== "?" || maxStreams !== "?")
-    ? `🔄 Потоки: *${streams}/${maxStreams}* активно\n` : "";
+  // Streams / threads
+  const streams    = u.active_threads ?? u.concurrent_tasks ?? u.streams ?? u.active ?? null;
+  const maxStreams  = u.max_threads   ?? u.max_concurrent   ?? u.max_streams          ?? null;
+
+  // Reset
+  const resetMin = u.reset_in_minutes ?? u.reset_in_min ?? u.reset_in ??
+                   (u.reset_in_seconds != null ? Math.floor(u.reset_in_seconds / 60) : null);
+  const resetAt  = u.reset_at
+    ? new Date(u.reset_at).toLocaleTimeString("ru")
+    : null;
+
+  const resetStr = resetMin != null
+    ? `*${Math.floor(resetMin)}м*${resetAt ? ` (в ${resetAt})` : ""}`
+    : resetAt ? `*${resetAt}*` : "*?*";
+
+  // Build lines
+  const imgLine     = `🖼 Изображения: *${imgUsed}/${imgTotal}*\n`;
+  const vidLine     = `🎬 Видео: *${vidUsed}/${vidTotal}*\n`;
+  const tokLine     = tokUsed != null ? `💬 Токены: *${tokUsed}/${tokTotal}*\n` : "";
+  const streamsLine = streams != null ? `🔄 Потоки: *${streams}/${maxStreams ?? "?"}*\n` : "";
+
+  // Debug: show raw keys if everything is "?"
+  const allUnknown = imgUsed === "?" && vidUsed === "?" && streams === null;
+  const debugLine  = allUnknown
+    ? `\n_Ключи API: ${Object.keys(u).slice(0,10).join(", ")}_\n` : "";
 
   return (
     `📊 *Баланс и лимиты*\n\n` +
-    credLine + imgLine + vidLine + streamsLine +
-    `⏱ Сброс через: *${resetIn}* (в ${resetAt})\n\n` +
+    imgLine + vidLine + tokLine + streamsLine +
+    `⏱ Сброс через: ${resetStr}\n` +
+    debugLine + `\n` +
     `*Стоимость моделей:*\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
