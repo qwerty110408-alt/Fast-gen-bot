@@ -21,17 +21,29 @@ function saveJSON(file, data) {
 const persistedStates = loadJSON(STATE_FILE, {});
 
 // ─── Локальный баланс (общий для всех) ───
-// Лимиты в час: 500 изображений, 15 видео, 200000 токенов промптов
 const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
+
+function nextHourReset() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(now.getHours() + 1, 0, 0, 0); // начало следующего часа
+  return next.getTime();
+}
 
 let balanceState = loadJSON(BALANCE_FILE, {
   images: 0, videos: 0, tokens: 0,
-  resetAt: Date.now() + 3600000, // сброс через час
+  resetAt: nextHourReset(),
 });
+
+// Если загрузили старый файл без правильного resetAt — пересчитаем
+if (!balanceState.resetAt || balanceState.resetAt < Date.now()) {
+  balanceState.resetAt = nextHourReset();
+  saveJSON(BALANCE_FILE, balanceState);
+}
 
 function checkResetBalance() {
   if (Date.now() >= balanceState.resetAt) {
-    balanceState = { images: 0, videos: 0, tokens: 0, resetAt: Date.now() + 3600000 };
+    balanceState = { images: 0, videos: 0, tokens: 0, resetAt: nextHourReset() };
     saveJSON(BALANCE_FILE, balanceState);
   }
 }
@@ -45,14 +57,17 @@ function spendBalance(type, amount = 1) {
 function formatBalance() {
   checkResetBalance();
   const b = balanceState;
-  const imgLeft  = Math.max(0, HOURLY_LIMITS.images - b.images);
-  const vidLeft  = Math.max(0, HOURLY_LIMITS.videos - b.videos);
-  const tokLeft  = Math.max(0, HOURLY_LIMITS.tokens - b.tokens);
+  const imgLeft = Math.max(0, HOURLY_LIMITS.images - b.images);
+  const vidLeft = Math.max(0, HOURLY_LIMITS.videos - b.videos);
+  const tokLeft = Math.max(0, HOURLY_LIMITS.tokens - b.tokens);
 
+  // Время до сброса
   const msLeft = Math.max(0, b.resetAt - Date.now());
-  const mLeft  = Math.ceil(msLeft / 60000);
-  const h = Math.floor(mLeft / 60), m = mLeft % 60;
+  const totalMin = Math.ceil(msLeft / 60000);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
   const resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
+  // Время сброса
+  const resetTime = new Date(b.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 
   function fmtTok(n) {
     if (n >= 1000000) return `${(n/1000000).toFixed(1).replace(".0","")}M`;
@@ -62,10 +77,10 @@ function formatBalance() {
 
   return (
     `📊 *Баланс и лимиты* (общий)\n\n` +
-    `🖼 Изображения: *${b.images}/${HOURLY_LIMITS.images}* (осталось: ${imgLeft})\n` +
-    `🎬 Видео: *${b.videos}/${HOURLY_LIMITS.videos}* (осталось: ${vidLeft})\n` +
-    `💬 Токены промптов: *${fmtTok(b.tokens)}/${fmtTok(HOURLY_LIMITS.tokens)}*\n` +
-    `⏱ Сброс через: *${resetStr}*\n\n` +
+    `🖼 Изображения: *${imgLeft}/${HOURLY_LIMITS.images}*\n` +
+    `🎬 Видео: *${vidLeft}/${HOURLY_LIMITS.videos}*\n` +
+    `💬 Токены промптов: *${fmtTok(tokLeft)}/${fmtTok(HOURLY_LIMITS.tokens)}*\n` +
+    `⏱ Сброс через: *${resetStr}* (в ${resetTime})\n\n` +
     `Стоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
@@ -524,17 +539,15 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Перегенерация — показать меню
+  // ── Перегенерация — показать меню (новым сообщением, не трогая результат)
   if (data.startsWith("show_regen_")) {
     const idx = parseInt(data.replace("show_regen_",""));
-    del();
     return showRegenMenu(chatId, idx);
   }
 
   // ── Перегенерация с фото (кнопка под результатом)
   if (data.startsWith("regen_")) {
     const parts = data.split("_");
-    // regen_<histIdx> — старый формат (под фото), берём последнюю запись
     if (parts.length === 2) {
       const h = getHistory(chatId);
       if (h.length === 0) return bot.sendMessage(chatId, "❌ История пуста");
