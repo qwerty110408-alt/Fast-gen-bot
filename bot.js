@@ -125,75 +125,62 @@ async function getUsageData() {
   return null;
 }
 
+function escMd(v) {
+  if (v == null) return "?";
+  return String(v).replace(/[_*`\[\]()~>#+=|{}.!\\-]/g, "\\$&");
+}
+
 function formatBalance(usage) {
-  if (!usage) return "❌ Не удалось получить баланс\n\n_Проверь API ключ или попробуй позже_";
+  if (!usage) return "❌ Не удалось получить баланс";
 
-  // API structure:
-  // currentusage: { hourlyusage: { images, videos, prompt_tokens, ... }, activethreads: N }
-  // accountlimits: { imggenperhourlimit, videogenperhourlimit, imggenerationthreadsallowed,
-  //                  videogenerationthreadsallowed, prompttokensperhourlimit,
-  //                  flowultrahourlimit, flowultrathreadsallowed }
-  // usagewindow:   { reset_at / resets_at / reset_in_minutes }
+  const cur    = usage.currentusage  || usage.current_usage || usage;
+  const lim    = usage.accountlimits || usage.account_limits || usage;
+  const win    = usage.usagewindow   || usage.usage_window  || {};
+  const hourly = cur.hourlyusage     || cur.hourly_usage    || cur;
 
-  const cur = usage.currentusage  || usage.current_usage || usage;
-  const lim = usage.accountlimits || usage.account_limits || usage;
-  const win = usage.usagewindow   || usage.usage_window  || {};
-
-  const hourly = cur.hourlyusage || cur.hourly_usage || cur;
-
-  // Images
-  const imgUsed  = hourly.images ?? hourly.image_count ?? hourly.imggen ?? "?";
-  const imgTotal = lim.imggenperhourlimit ?? lim.img_gen_per_hour_limit ?? lim.images ?? "?";
-
-  // Videos
-  const vidUsed  = hourly.videos ?? hourly.video_count ?? hourly.videogen ?? "?";
+  const imgUsed  = hourly.images   ?? hourly.image_count ?? hourly.imggen   ?? "?";
+  const imgTotal = lim.imggenperhourlimit ?? lim.img_gen_per_hour_limit     ?? lim.images ?? "?";
+  const vidUsed  = hourly.videos   ?? hourly.video_count ?? hourly.videogen ?? "?";
   const vidTotal = lim.videogenperhourlimit ?? lim.video_gen_per_hour_limit ?? lim.videos ?? "?";
-
-  // Prompt tokens
   const tokUsed  = hourly.prompt_tokens ?? hourly.prompttokens ?? hourly.tokens ?? null;
   const tokTotal = lim.prompttokensperhourlimit ?? lim.prompt_tokens_per_hour_limit ?? null;
-
-  // Threads (activethreads is a number directly on currentusage)
   const threads    = cur.activethreads ?? cur.active_threads ?? null;
-  const imgThreads = lim.imggenerationthreadsallowed ?? null;
+  const imgThreads = lim.imggenerationthreadsallowed   ?? null;
   const vidThreads = lim.videogenerationthreadsallowed ?? null;
 
-  // Reset time from usagewindow
-  const resetMin = win.reset_in_minutes ?? win.reset_in ?? win.minutes_until_reset ??
-                   usage.reset_in_minutes ?? null;
+  const resetMin   = win.reset_in_minutes ?? win.reset_in ?? usage.reset_in_minutes ?? null;
   const resetAtRaw = win.reset_at ?? win.resets_at ?? usage.reset_at ?? null;
-  const resetStr = resetMin != null
-    ? `*${Math.floor(resetMin)}м*${resetAtRaw ? ` (в ${new Date(resetAtRaw).toLocaleTimeString("ru")})` : ""}`
-    : resetAtRaw
-      ? `*${new Date(resetAtRaw).toLocaleTimeString("ru")}*`
-      : "*?*";
+  let resetStr = "?";
+  if (resetMin != null) resetStr = `${Math.floor(resetMin)}м`;
+  else if (resetAtRaw) { try { resetStr = new Date(resetAtRaw).toLocaleTimeString("ru"); } catch {} }
 
-  const tokLine     = tokUsed  != null ? `💬 Токены: *${tokUsed}/${tokTotal ?? "?"}*\n` : "";
-  const threadLine  = threads  != null
-    ? `🔄 Потоки: 🖼 *${threads}/${imgThreads ?? "?"}* | 🎬 *${threads}/${vidThreads ?? "?"}*\n`
+  const tokLine    = tokUsed  != null ? `💬 Токены: ${escMd(tokUsed)}/${escMd(tokTotal)}\n` : "";
+  const threadLine = threads  != null
+    ? `🔄 Потоки: 🖼 ${escMd(threads)}/${escMd(imgThreads)} | 🎬 ${escMd(threads)}/${escMd(vidThreads)}\n`
     : "";
 
-  // Debug only if still unknown
   const allUnknown = imgUsed === "?" && vidUsed === "?";
   const debugLine  = allUnknown
-    ? `\n_hourly: ${Object.keys(hourly).join(", ")}_\n_lim: ${Object.keys(lim).join(", ")}_\n`
+    ? `\nhourly keys: ${Object.keys(hourly).join(", ")}\nlim keys: ${Object.keys(lim).join(", ")}\n`
     : "";
 
+  const time = new Date().toLocaleTimeString("ru");
+
   return (
-    `📊 *Баланс и лимиты*\n\n` +
-    `🖼 Изображения: *${imgUsed}/${imgTotal}*\n` +
-    `🎬 Видео: *${vidUsed}/${vidTotal}*\n` +
+    `📊 Баланс и лимиты\n\n` +
+    `🖼 Изображения: ${imgUsed}/${imgTotal}\n` +
+    `🎬 Видео: ${vidUsed}/${vidTotal}\n` +
     tokLine + threadLine +
     `⏱ Сброс через: ${resetStr}\n` +
     debugLine + `\n` +
-    `*Стоимость моделей:*\n` +
+    `Стоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
     `🖼 Grok качество: 1 кред = 4 фото\n` +
     `🖼 NanoBanana Flower / ChatGPT: 1 кред\n` +
     `🎬 Veo 3.1 Fast/Light/Flower/Grok: 1 кред\n` +
-    `🎬 Veo 3.1 Quality: *10 кред* ⚠️\n\n` +
-    `_Обновлено: ${new Date().toLocaleTimeString("ru")}_`
+    `🎬 Veo 3.1 Quality: 10 кред ⚠️\n\n` +
+    `Обновлено: ${time}`
   );
 }
 
@@ -206,9 +193,9 @@ async function showBalance(chatId, msgId = null) {
       [{ text: "◀️ Назад", callback_data: "close_balance" }],
     ]};
     if (msgId) {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: kb }).catch(()=>{});
     } else {
-      const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+      const m = await bot.sendMessage(chatId, text, { reply_markup: kb });
       getState(chatId).balanceMsgId = m.message_id;
     }
   } catch(e) {
