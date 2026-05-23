@@ -229,6 +229,8 @@ function formatBalance(usage) {
     if (imgUsed === "?" && vidUsed === "?") {
       const hkeys = Object.keys(hourly).join(", ").slice(0, 120);
       dbg.push(`[hourly: ${hkeys}]`);
+      // Показываем RAW значение image_generation
+      dbg.push(`[img_raw: ${JSON.stringify(imgRaw).slice(0, 150)}]`);
     }
     if (resetStr === "?") {
       const wkeys = Object.keys(win).join(", ").slice(0, 80);
