@@ -419,7 +419,7 @@ function showBatchMenu(chatId, msgId = null) {
   const bt = s.batchType || "image";
   const isImage = bt === "image";
   const isVideoImage = bt === "video_image";
-  const MAX_PROMPTS = isImage ? 500 : 15;
+  const MAX_PROMPTS = isImage ? 500 : 200;
   const currentPrompt = prompts.length > 0 ? prompts[idx] : null;
 
   const modelLabel = isImage
@@ -614,7 +614,7 @@ async function runPromptGen(chatId, storyText) {
   }
 
   const bt = s.batchType || "image";
-  const MAX = bt === "image" ? 500 : 15;
+  const MAX = bt === "image" ? 500 : 200;
   const available = MAX - s.batchPrompts.length;
   const toAdd = results.slice(0, available);
   s.batchPrompts.push(...toAdd);
@@ -1004,15 +1004,16 @@ bot.on("document", async (msg) => {
     try {
       const text = await readTxt();
       const prompts = text.split("\n").map(p => p.trim()).filter(Boolean);
-      const isImage = s.tab === "image";
-      const MAX = isImage ? 500 : 15;
+      const bt = s.batchType || "image";
+      const isImage = bt === "image";
+      const MAX = isImage ? 500 : 200; // видео: 200, почасовой режим разобьёт по 15
       const toAdd = prompts.slice(0, MAX - s.batchPrompts.length);
       const skipped = prompts.length - toAdd.length;
       s.batchPrompts.push(...toAdd);
       s.batchPromptIdx = 0;
       let reply = `✅ Загружено ${toAdd.length} промптов из файла!`;
-      if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped}`;
-      bot.sendMessage(chatId, reply, { reply_markup: { inline_keyboard: [[{ text:"📦 Открыть пакет", callback_data:"do_batch" }]] } });
+      if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped} (лимит ${MAX})`;
+      bot.sendMessage(chatId, reply, { reply_markup: { inline_keyboard: [[{ text:"📦 Открыть пакет", callback_data:"do_batch_menu" }]] } });
     } catch(e) { bot.sendMessage(chatId, `❌ Ошибка файла: ${e.message}`); }
   }
 });
@@ -1088,16 +1089,17 @@ bot.on("message", async (msg) => {
   }
   if (s.step === "waiting_batch_prompts") {
     s.step = null;
-    const isImage = s.tab === "image";
-    const MAX = isImage ? 500 : 15;
+    const bt = s.batchType || "image";
+    const isImage = bt === "image";
+    const MAX = isImage ? 500 : 200; // видео: 200 промптов, почасовой режим сам разобьёт по 15
     const prompts = msg.text.split("\n").map(p => p.trim()).filter(Boolean);
     const toAdd = prompts.slice(0, MAX - s.batchPrompts.length);
     const skipped = prompts.length - toAdd.length;
     s.batchPrompts.push(...toAdd);
     s.batchPromptIdx = Math.max(0, s.batchPrompts.length - toAdd.length);
     let reply = `✅ Добавлено ${toAdd.length} промптов!`;
-    if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped}`;
-    return bot.sendMessage(chatId, reply, { reply_markup: { inline_keyboard: [[{ text:"📦 Меню пакета", callback_data:"do_batch" }]] } });
+    if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped} (лимит ${MAX})`;
+    return bot.sendMessage(chatId, reply, { reply_markup: { inline_keyboard: [[{ text:"📦 Меню пакета", callback_data:"do_batch_menu" }]] } });
   }
   if (s.step === "waiting_pg_apikey") {
     s.pgApiKey = msg.text.trim(); s.step = null; saveState(chatId);
@@ -1259,8 +1261,9 @@ async function runBatch(chatId) {
   // ── Обычный пакет (фото или видео ≤15)
   const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
+  const typeLabel = isImage ? "🖼 Фото" : isVideoImage ? "📸 Видео из фото" : "🎬 Видео";
   const statusMsg = await bot.sendMessage(chatId,
-    `📦 *Пакетный режим*\nЗадач: ${total} | ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
+    `📦 *Пакетный режим*\n${typeLabel} | Задач: ${total} | ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
     { parse_mode: "Markdown" });
 
   const allTasks = tasks.map(task =>
