@@ -7,44 +7,41 @@ const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
 const BASE_URL = "https://googler.fast-gen.ai";
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// ─── Хранилище ────────────────────────────
-const userState = {};   // настройки и шаги
-const history = {};     // история генераций
+const userState = {};
+const history = {};
 
-// ─── Модели ───────────────────────────────
 const IMAGE_MODELS = {
-  "imagen4_flow":  { label: "Imagen 4 - Flow",        ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото" },
-  "nanopro_flow":  { label: "Nano Banana Pro - Flow",  ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото", model: "nano-banana-pro" },
-  "nanob2_flow":   { label: "Nano Banana 2 - Flow",    ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото", model: "nano-banana-2" },
-  "grok_fast":     { label: "Grok (быстро)",           ep: "/api/v4/grok/image/generate",   credits: "1 кред = 6 фото", quality: "fast" },
-  "grok_quality":  { label: "Grok (качество)",         ep: "/api/v4/grok/image/generate",   credits: "1 кред = 4 фото", quality: "quality" },
-  "nanob2_flower": { label: "Nano Banana 2 - Flower",  ep: "/api/v4/flower/image/generate", credits: "1 кред = 1 фото" },
-  "chatgpt":       { label: "ChatGPT Images 2.0",      ep: "/api/v4/openai/image/generate", credits: "1 кред = 1 фото" },
+  "imagen4_flow":  { label: "Imagen 4 - Flow",       ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото" },
+  "nanopro_flow":  { label: "Nano Banana Pro - Flow", ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото", model: "nano-banana-pro" },
+  "nanob2_flow":   { label: "Nano Banana 2 - Flow",   ep: "/api/v4/flow/image/generate",   credits: "4 кред = 1 фото", model: "nano-banana-2" },
+  "grok_fast":     { label: "Grok (быстро)",          ep: "/api/v4/grok/image/generate",   credits: "1 кред = 6 фото", quality: "fast" },
+  "grok_quality":  { label: "Grok (качество)",        ep: "/api/v4/grok/image/generate",   credits: "1 кред = 4 фото", quality: "quality" },
+  "nanob2_flower": { label: "Nano Banana 2 - Flower", ep: "/api/v4/flower/image/generate", credits: "1 кред = 1 фото" },
+  "chatgpt":       { label: "ChatGPT Images 2.0",     ep: "/api/v4/openai/image/generate", credits: "1 кред = 1 фото" },
 };
 
 const VIDEO_MODELS = {
-  "veo31_fast":    { label: "Veo 3.1 Fast",     epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-fast",    credits: "1 кред = 1 видео" },
-  "veo31_light":   { label: "Veo 3.1 Light",    epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-light",   credits: "1 кред = 1 видео" },
-  "veo31_quality": { label: "Veo 3.1 Quality",  epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-quality", credits: "10 кред = 1 видео" },
-  "grok_vid":      { label: "Grok Video",        epT: "/api/v4/grok/video/from-text",   epI: "/api/v4/grok/video/from-image",   credits: "1 кред = 1 видео", res: true },
-  "veo31_flower":  { label: "Veo 3.1 Flower",   epT: "/api/v4/flower/video/from-text", epI: "/api/v4/flower/video/from-image", credits: "1 кред = 1 видео" },
+  "veo31_fast":    { label: "Veo 3.1 Fast",    epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-fast",    credits: "1 кред = 1 видео" },
+  "veo31_light":   { label: "Veo 3.1 Light",   epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-light",   credits: "1 кред = 1 видео" },
+  "veo31_quality": { label: "Veo 3.1 Quality", epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-image",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-quality", credits: "10 кред = 1 видео ⚠️" },
+  "grok_vid":      { label: "Grok Video",       epT: "/api/v4/grok/video/from-text",   epI: "/api/v4/grok/video/from-image",   credits: "1 кред = 1 видео", res: true, defaultRes: "720p" },
+  "veo31_flower":  { label: "Veo 3.1 Flower",  epT: "/api/v4/flower/video/from-text", epI: "/api/v4/flower/video/from-image", credits: "1 кред = 1 видео" },
 };
 
 const RATIOS = ["16:9","9:16","1:1","4:3","3:4","3:2","2:3"];
-const COUNTS = [1,2,3,4,5,6,8,10];
+// Количество вводится вручную (до 500)
 
 function getState(chatId) {
   if (!userState[chatId]) userState[chatId] = {
     step: null, tab: "image",
     imgModel: "imagen4_flow", vidModel: "veo31_fast",
     ratio: "16:9", count: 1, perPrompt: 1,
-    seed: "random", resolution: "720p",
-    mode: "normal",       // normal | batch | keyframes
-    batchPrompts: [],     // массив промптов для пакетного режима
-    batchPhotos: [],      // массив fileId фото
+    seed: "random", resolution: "720p", mode: "normal",
+    batchPrompts: [], batchPhotos: [],
+    batchPromptIdx: 0, // текущий индекс просмотра промпта
     keyframeStart: null, keyframeEnd: null,
     fileId: null,
-    currentBatchIdx: 0,
+    balanceMsgId: null, // для live-обновления баланса
   };
   return userState[chatId];
 }
@@ -60,7 +57,7 @@ function addHistory(chatId, entry) {
   if (h.length > 50) h.pop();
 }
 
-// ─── Медиа из ответа ──────────────────────
+// ─── Медиа ────────────────────────────────
 function extractMedia(data) {
   if (Array.isArray(data.result) && data.result.length > 0) return { base64: data.result[0], type: data.media_type || "video" };
   if (typeof data.result === "string" && data.result.startsWith("data:")) return { base64: data.result, type: data.media_type || "video" };
@@ -69,19 +66,21 @@ function extractMedia(data) {
   return null;
 }
 
-async function sendMedia(chatId, media, isImage, caption) {
+async function sendMedia(chatId, media, isImage, caption, replyMarkup = null) {
   if (media.base64) {
     let b64 = media.base64, ext = isImage ? "jpg" : "mp4";
     if (b64.includes(";base64,")) { const p = b64.split(";base64,"); b64 = p[1]; if (p[0].includes("png")) ext="png"; }
     const tmp = `/tmp/fg_${Date.now()}.${ext}`;
     fs.writeFileSync(tmp, Buffer.from(b64, "base64"));
     try {
-      if (isImage) await bot.sendPhoto(chatId, fs.createReadStream(tmp), { caption, parse_mode: "Markdown" });
-      else await bot.sendVideo(chatId, fs.createReadStream(tmp), { caption, parse_mode: "Markdown" });
+      const opts = { caption, parse_mode: "Markdown", ...(replyMarkup && { reply_markup: replyMarkup }) };
+      if (isImage) await bot.sendPhoto(chatId, fs.createReadStream(tmp), opts);
+      else await bot.sendVideo(chatId, fs.createReadStream(tmp), opts);
     } finally { try { fs.unlinkSync(tmp); } catch {} }
   } else if (media.url) {
-    if (isImage) await bot.sendPhoto(chatId, media.url, { caption, parse_mode: "Markdown" });
-    else await bot.sendVideo(chatId, media.url, { caption, parse_mode: "Markdown" });
+    const opts = { caption, parse_mode: "Markdown", ...(replyMarkup && { reply_markup: replyMarkup }) };
+    if (isImage) await bot.sendPhoto(chatId, media.url, opts);
+    else await bot.sendVideo(chatId, media.url, opts);
   }
 }
 
@@ -94,7 +93,6 @@ async function pollResult(opId, max=36, interval=10000) {
         headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
       });
       const st = data.status || data.state;
-      console.log(`Poll[${i+1}] ${opId}: ${st}`);
       if (["completed","success","done","finished"].includes(st)) return extractMedia(data);
       if (["failed","error","cancelled"].includes(st)) throw new Error(`Статус: ${st}`);
     } catch(e) { if (e.message.startsWith("Статус")) throw e; }
@@ -102,79 +100,114 @@ async function pollResult(opId, max=36, interval=10000) {
   return null;
 }
 
-// ─── Баланс кредитов ─────────────────────
-async function getCredits() {
-  try {
-    const { data } = await axios.get(`${BASE_URL}/api/v4/`, {
-      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
-    });
-    return data;
-  } catch(e) { return null; }
-}
-
-async function getUsage() {
+// ─── Баланс ───────────────────────────────
+async function getUsageData() {
   try {
     const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
       headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
     });
+    console.log("[balance raw]", JSON.stringify(data).slice(0, 300));
     return data;
-  } catch(e) { return null; }
+  } catch(e) { console.error("[balance error]", e.message); return null; }
 }
 
-// ─── /start /menu ─────────────────────────
-bot.onText(/\/start/, (msg) => { userState[msg.chat.id]=null; showMainMenu(msg.chat.id); });
-bot.onText(/\/menu/, (msg) => showMainMenu(msg.chat.id));
-bot.onText(/\/balance/, async (msg) => showBalance(msg.chat.id));
-bot.onText(/\/history/, (msg) => showHistory(msg.chat.id));
-bot.onText(/\/check (.+)/, async (msg, m) => checkOperation(msg.chat.id, m[1].trim()));
+function formatBalance(usage) {
+  if (!usage) return "❌ Не удалось получить баланс";
 
-// ─── Показать баланс ──────────────────────
-async function showBalance(chatId) {
-  const msg = await bot.sendMessage(chatId, "⏳ Получаю баланс...");
-  const usage = await getUsage();
-  if (usage) {
-    const imgUsed = usage.images_used ?? "?";
-    const imgTotal = usage.images_limit ?? "?";
-    const vidUsed = usage.videos_used ?? "?";
-    const vidTotal = usage.videos_limit ?? "?";
-    const streams = usage.active_threads ?? "?";
-    const maxStreams = usage.max_threads ?? "?";
-    const resetIn = usage.reset_in_minutes ? `${Math.floor(usage.reset_in_minutes)}м` : "?";
-    const resetAt = usage.reset_at ? new Date(usage.reset_at).toLocaleTimeString("ru") : "?";
-    const text =
-      `📊 *Баланс и лимиты*\n\n` +
-      `🖼 Изображения: *${imgUsed}/${imgTotal}* за час\n` +
-      `🎬 Видео: *${vidUsed}/${vidTotal}* за час\n` +
-      `🔄 Потоки: *${streams}/${maxStreams}* активно\n\n` +
-      `⏱ Сброс через: *${resetIn}* (в ${resetAt})\n\n` +
-      `*Стоимость моделей:*\n` +
-      `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
-      `🖼 Grok быстро: 1 кред = 6 фото\n` +
-      `🖼 Grok качество: 1 кред = 4 фото\n` +
-      `🖼 NanoBanana Flower / ChatGPT: 1 кред\n` +
-      `🎬 Veo 3.1 Fast/Light/Flower: 1 кред\n` +
-      `🎬 Veo 3.1 Quality: *10 кред* ⚠️\n` +
-      `🎬 Grok Video: 1 кред`;
-    await bot.editMessageText(text, { chat_id: chatId, message_id: msg.message_id, parse_mode: "Markdown" });
+  // API v5 returns credits-based fields; support multiple field name variants
+  const credUsed  = usage.credits_used   ?? usage.used_credits   ?? usage.images_used  ?? "?";
+  const credTotal = usage.credits_limit  ?? usage.total_credits  ?? usage.images_limit ?? "?";
+  const credLeft  = usage.credits_left   ?? usage.remaining_credits ??
+                    (credTotal !== "?" && credUsed !== "?" ? credTotal - credUsed : "?");
+
+  const imgUsed   = usage.images_used    ?? usage.image_count    ?? "?";
+  const imgTotal  = usage.images_limit   ?? usage.image_limit    ?? "?";
+  const vidUsed   = usage.videos_used    ?? usage.video_count    ?? "?";
+  const vidTotal  = usage.videos_limit   ?? usage.video_limit    ?? "?";
+
+  const streams    = usage.active_threads ?? usage.concurrent_tasks ?? usage.streams ?? "?";
+  const maxStreams  = usage.max_threads    ?? usage.max_concurrent  ?? usage.max_streams ?? "?";
+
+  const resetIn = usage.reset_in_minutes != null
+    ? `${Math.floor(usage.reset_in_minutes)}м`
+    : (usage.reset_in_seconds != null ? `${Math.floor(usage.reset_in_seconds/60)}м` : "?");
+  const resetAt = usage.reset_at
+    ? new Date(usage.reset_at).toLocaleTimeString("ru")
+    : "?";
+
+  // Build lines only for fields we actually have
+  const imgLine = (imgUsed !== "?" || imgTotal !== "?")
+    ? `🖼 Изображения: *${imgUsed}/${imgTotal}* за час\n` : "";
+  const vidLine = (vidUsed !== "?" || vidTotal !== "?")
+    ? `🎬 Видео: *${vidUsed}/${vidTotal}* за час\n` : "";
+  const credLine = (credLeft !== "?" || credTotal !== "?")
+    ? `💳 Кредиты: *${credLeft}/${credTotal}* осталось\n` : "";
+  const streamsLine = (streams !== "?" || maxStreams !== "?")
+    ? `🔄 Потоки: *${streams}/${maxStreams}* активно\n` : "";
+
+  return (
+    `📊 *Баланс и лимиты*\n\n` +
+    credLine + imgLine + vidLine + streamsLine +
+    `⏱ Сброс через: *${resetIn}* (в ${resetAt})\n\n` +
+    `*Стоимость моделей:*\n` +
+    `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
+    `🖼 Grok быстро: 1 кред = 6 фото\n` +
+    `🖼 Grok качество: 1 кред = 4 фото\n` +
+    `🖼 NanoBanana Flower / ChatGPT: 1 кред\n` +
+    `🎬 Veo 3.1 Fast/Light/Flower/Grok: 1 кред\n` +
+    `🎬 Veo 3.1 Quality: *10 кред* ⚠️\n\n` +
+    `_Обновлено: ${new Date().toLocaleTimeString("ru")}_`
+  );
+}
+
+async function showBalance(chatId, msgId = null) {
+  const usage = await getUsageData();
+  const text = formatBalance(usage);
+  const kb = { inline_keyboard: [
+    [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
+    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+  if (msgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
   } else {
-    await bot.editMessageText("❌ Не удалось получить баланс", { chat_id: chatId, message_id: msg.message_id });
+    const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+    getState(chatId).balanceMsgId = m.message_id;
+  }
+}
+
+// Живое обновление баланса во время генерации
+async function liveBalanceUpdate(chatId, msgId, intervalMs = 15000, durationMs = 300000) {
+  const end = Date.now() + durationMs;
+  while (Date.now() < end) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    const usage = await getUsageData();
+    if (!usage) continue;
+    try {
+      await bot.editMessageText(formatBalance(usage), {
+        chat_id: chatId, message_id: msgId, parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "refresh_balance" }],[{ text: "◀️ Назад", callback_data: "back_menu" }]] }
+      });
+    } catch {}
   }
 }
 
 // ─── История ──────────────────────────────
-async function showHistory(chatId) {
+function showHistoryMenu(chatId, msgId = null) {
   const h = getHistory(chatId);
-  if (h.length === 0) return bot.sendMessage(chatId, "📭 История пуста.");
-
-  const rows = h.slice(0, 10).map((item, i) => [{
-    text: `${item.index} | ${item.model} | ${item.prompt.slice(0, 20)}...`,
+  if (h.length === 0) {
+    const text = "📭 История пуста.";
+    if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId }).catch(()=>{});
+    else bot.sendMessage(chatId, text);
+    return;
+  }
+  const rows = h.slice(0,10).map((item,i) => [{
+    text: `${item.index || i+1} | ${item.model.slice(0,15)} | ${item.prompt.slice(0,20)}`,
     callback_data: `hist_${i}`
   }]);
   rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
-  bot.sendMessage(chatId, "📋 *История генераций:*", {
-    parse_mode: "Markdown",
-    reply_markup: { inline_keyboard: rows }
-  });
+  const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
+  if (msgId) bot.editMessageText("📋 *История:*", { chat_id: chatId, message_id: msgId, ...opts }).catch(()=>{});
+  else bot.sendMessage(chatId, "📋 *История:*", opts);
 }
 
 // ─── Главное меню ─────────────────────────
@@ -184,23 +217,77 @@ function showMainMenu(chatId) {
   const vm = VIDEO_MODELS[s.vidModel];
   bot.sendMessage(chatId,
     `🤖 *FastGen Bot*\n\n` +
-    `🖼 Фото: *${im.label}* (${im.credits})\n` +
-    `🎬 Видео: *${vm.label}* (${vm.credits})\n` +
-    `📐 Соотношение: *${s.ratio}* | 🔢 Кол-во: *${s.count}*\n` +
-    `📦 Режим: *${s.mode === "batch" ? "Пакетный" : s.mode === "keyframes" ? "Ключ. кадры" : "Обычный"}*`,
-    {
-      parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [
-        [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🎬 Видео из текста", callback_data: "do_vtext" }],
-        [{ text: "📸 Видео из фото", callback_data: "do_vimage" }, { text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
-        [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
-        [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
-        [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Кол-во", callback_data: "open_count" }],
-        [{ text: "📊 Баланс", callback_data: "show_balance" }, { text: "📋 История", callback_data: "show_history" }],
-      ]}
-    }
+    `🖼 Фото: *${im.label}*\n└ ${im.credits}\n` +
+    `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
+    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`,
+    { parse_mode: "Markdown", reply_markup: { inline_keyboard: [
+      [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🎬 Видео из текста", callback_data: "do_vtext" }],
+      [{ text: "📸 Видео из фото", callback_data: "do_vimage" }, { text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
+      [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
+      [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
+      [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
+      [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
+      ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+      [{ text: "📋 История", callback_data: "show_history" }],
+    ]}}
   );
 }
+
+// ─── Промпт-навигатор для пакетного режима ─
+function showBatchMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const prompts = s.batchPrompts;
+  const photos = s.batchPhotos;
+  const idx = s.batchPromptIdx || 0;
+  const hasPrompts = prompts.length > 0;
+  const currentPrompt = hasPrompts ? prompts[idx] : null;
+
+  const isImage = s.tab === "image";
+  const MAX_PROMPTS = isImage ? 500 : 15;
+
+  const text =
+    `📦 *Пакетный режим*\n\n` +
+    `📝 Промптов: *${prompts.length}/${MAX_PROMPTS}*\n` +
+    `📸 Фото: *${photos.length}*\n` +
+    `🔢 На 1 промпт/фото: *${s.perPrompt}* вар.\n` +
+    `Всего задач: *${(prompts.length + photos.length) * s.perPrompt}*\n\n` +
+    (currentPrompt ? `*Промпт ${idx+1}/${prompts.length}:*\n${currentPrompt}` : "_Промптов нет_");
+
+  const navRow = hasPrompts ? [
+    { text: "◀️", callback_data: "bp_prev" },
+    { text: `${idx+1}/${prompts.length}`, callback_data: "noop" },
+    { text: "▶️", callback_data: "bp_next" },
+    { text: "🗑 Удалить", callback_data: "bp_delete" },
+  ] : [];
+
+  const kb = { inline_keyboard: [
+    ...(navRow.length ? [navRow] : []),
+    [{ text: "✏️ Добавить промпты", callback_data: "batch_add_text" }, { text: "📄 Из файла .txt", callback_data: "batch_from_file" }],
+    [{ text: "📸 Фото управление", callback_data: "batch_photos_menu" }],
+    [{ text: `🔢 На 1 промпт: ${s.perPrompt}`, callback_data: "batch_per_prompt" }],
+    [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
+    [{ text: "🗑 Очистить всё", callback_data: "batch_clear" }, { text: "❌ Отмена", callback_data: "back_menu" }],
+  ]};
+
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+function showBatchPhotosMenu(chatId, msgId) {
+  const s = getState(chatId);
+  const photos = s.batchPhotos;
+  const text = `📸 *Фото в пакете: ${photos.length}*\n\nДобавь фото отправив их в чат.\nДля удаления нажми кнопку:`;
+  const rows = photos.map((_, i) => [{ text: `🗑 Удалить фото ${i+1}`, callback_data: `del_photo_${i}` }]);
+  rows.push([{ text: "◀️ Назад", callback_data: "do_batch" }]);
+  bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } }).catch(()=>{});
+}
+
+// ─── /start /menu ─────────────────────────
+bot.onText(/\/start/, (msg) => { userState[msg.chat.id]=null; showMainMenu(msg.chat.id); });
+bot.onText(/\/menu/, (msg) => showMainMenu(msg.chat.id));
+bot.onText(/\/balance/, (msg) => showBalance(msg.chat.id));
+bot.onText(/\/history/, (msg) => showHistoryMenu(msg.chat.id));
+bot.onText(/\/check (.+)/, async (msg, m) => checkOperation(msg.chat.id, m[1].trim()));
 
 // ─── Callbacks ────────────────────────────
 bot.on("callback_query", async (query) => {
@@ -210,151 +297,148 @@ bot.on("callback_query", async (query) => {
   const s = getState(chatId);
   bot.answerCallbackQuery(query.id);
 
-  const del = () => bot.deleteMessage(chatId, msgId).catch(() => {});
+  const del = () => bot.deleteMessage(chatId, msgId).catch(()=>{});
   const edit = (text, kb) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb });
   const cancelKb = { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] };
 
   if (data === "back_menu") { del(); return showMainMenu(chatId); }
   if (data === "noop") return;
 
-  // ── Баланс и история
+  // ── Баланс
   if (data === "show_balance") { del(); return showBalance(chatId); }
-  if (data === "show_history") { del(); return showHistory(chatId); }
+  if (data === "refresh_balance") return showBalance(chatId, msgId);
 
-  // ── История — просмотр элемента
+  // ── История
+  if (data === "show_history") { return showHistoryMenu(chatId, msgId); }
   if (data.startsWith("hist_")) {
-    const idx = parseInt(data.replace("hist_", ""));
+    const idx = parseInt(data.replace("hist_",""));
     const h = getHistory(chatId);
     const item = h[idx];
     if (!item) return;
-    const text = `📋 *${item.index}*\n\n` +
-      `Модель: ${item.model}\n📝 ${item.prompt}\n` +
-      `${item.opId ? `ID: \`${item.opId}\`` : ""}`;
-    return edit(text, { inline_keyboard: [
-      item.opId ? [{ text: "🔄 Перегенерировать", callback_data: `regen_${item.opId}_${idx}` }] : [],
-      [{ text: "◀️ Назад", callback_data: "show_history" }],
-    ].filter(r => r.length > 0) });
+    return edit(
+      `📋 *${item.index || idx+1}*\n\nМодель: ${item.model}\n📝 ${item.prompt}\n${item.opId ? `ID: \`${item.opId}\`` : ""}`,
+      { inline_keyboard: [
+        item.opId ? [{ text: "🔄 Перегенерировать", callback_data: `regen_${idx}` }] : [],
+        [{ text: "◀️ К истории", callback_data: "show_history" }],
+      ].filter(r=>r.length) }
+    );
   }
-
-  // ── Перегенерация
   if (data.startsWith("regen_")) {
-    const parts = data.split("_");
-    const opId = parts[1];
-    const histIdx = parseInt(parts[2]);
+    const histIdx = parseInt(data.replace("regen_",""));
     const h = getHistory(chatId);
     const item = h[histIdx];
     if (!item) return;
-
-    await edit("⏳ Повторная генерация...", { inline_keyboard: [] });
+    await edit("⏳ Перегенерация...", { inline_keyboard: [] });
     try {
-      // Повторяем тот же запрос
       const { data: apiData } = await axios.post(`${BASE_URL}${item.endpoint}`, item.body, {
-        headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
-        timeout: 60000,
+        headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" }, timeout: 60000
       });
-      const newOpId = apiData.operation_id || apiData.task_id || apiData.id;
-      const result = await pollResult(newOpId);
+      const opId = apiData.operation_id || apiData.task_id || apiData.id;
+      const result = await pollResult(opId);
       if (result) {
         await bot.editMessageText(`✅ Перегенерировано: *${item.index}*`, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown" });
         await sendMedia(chatId, result, item.isImage, `🔄 *${item.index}* (перегенерация)\n📝 _${item.prompt.slice(0,100)}_`);
       }
     } catch(e) {
-      await bot.editMessageText(`❌ Ошибка перегенерации: ${e.message}`, { chat_id: chatId, message_id: msgId });
+      await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: chatId, message_id: msgId });
     }
     return;
   }
 
-  // ── Режимы генерации
-  if (data === "do_image") {
-    s.step = "waiting_prompt"; s.tab = "image"; s.mode = "normal";
-    return edit(`🖼️ *Изображение*\nМодель: ${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, cancelKb);
-  }
-  if (data === "do_vtext") {
-    s.step = "waiting_prompt"; s.tab = "video_text"; s.mode = "normal";
-    return edit(`🎬 *Видео из текста*\nМодель: ${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, cancelKb);
-  }
-  if (data === "do_vimage") {
-    s.step = "waiting_photo"; s.tab = "video_image"; s.mode = "normal";
-    return edit("📸 *Видео из фото*\n\nОтправь фото:", cancelKb);
-  }
+  // ── Режимы
+  if (data === "do_image") { s.step="waiting_prompt"; s.tab="image"; s.mode="normal"; return edit(`🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, cancelKb); }
+  if (data === "do_vtext") { s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal"; return edit(`🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, cancelKb); }
+  if (data === "do_vimage") { s.step="waiting_photo"; s.tab="video_image"; s.mode="normal"; return edit("📸 *Видео из фото*\n\nОтправь фото:", cancelKb); }
   if (data === "do_keyframes") {
-    s.step = "waiting_keyframe_start"; s.tab = "video_text"; s.mode = "keyframes";
-    s.keyframeStart = null; s.keyframeEnd = null;
-    return edit("🎞 *Ключевые кадры*\n\nОтправь *первое* фото (начало видео):", cancelKb);
+    s.step="waiting_keyframe_start"; s.tab="video_text"; s.mode="keyframes"; s.keyframeStart=null; s.keyframeEnd=null;
+    return edit("🎞 *Ключевые кадры*\n\nОтправь *первое* фото (начало):", cancelKb);
   }
+  if (data === "kf_skip_end") { s.step="waiting_prompt"; return edit("✅ Только начальный кадр.\n\nНапиши описание:", cancelKb); }
 
   // ── Пакетный режим
-  if (data === "do_batch") {
-    s.mode = "batch"; s.batchPrompts = []; s.batchPhotos = [];
-    return edit(
-      `📦 *Пакетный режим*\n\n` +
-      `Отправь несколько фото и/или напиши промпты (каждый с новой строки).\n\n` +
-      `Сейчас: 0 фото, 0 промптов\n\n` +
-      `Когда готов — нажми *Генерировать*`,
-      { inline_keyboard: [
-        [{ text: "✏️ Добавить промпты текстом", callback_data: "batch_add_text" }],
-        [{ text: `🔢 На 1 промпт/фото: ${s.perPrompt} вар.`, callback_data: "batch_per_prompt" }],
-        [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
-        [{ text: "❌ Отмена", callback_data: "back_menu" }],
-      ]}
-    );
-  }
-  if (data === "batch_add_text") {
-    s.step = "waiting_batch_prompts";
-    return edit("✏️ Напиши промпты, каждый с новой строки:", cancelKb);
+  if (data === "do_batch") { s.mode="batch"; return showBatchMenu(chatId, msgId); }
+  if (data === "batch_add_text") { s.step="waiting_batch_prompts"; return edit("✏️ Напиши промпты, каждый с новой строки:", cancelKb); }
+  if (data === "batch_from_file") { s.step="waiting_txt_file"; return edit("📄 Отправь .txt файл с промптами (каждый с новой строки):", cancelKb); }
+  if (data === "batch_photos_menu") return showBatchPhotosMenu(chatId, msgId);
+  if (data.startsWith("del_photo_")) {
+    const pi = parseInt(data.replace("del_photo_",""));
+    s.batchPhotos.splice(pi, 1);
+    return showBatchPhotosMenu(chatId, msgId);
   }
   if (data === "batch_per_prompt") {
     return edit("🔢 Сколько генераций на 1 промпт/фото?", { inline_keyboard: [
-      [1,2,3,4,5].map(n => ({ text: s.perPrompt===n?`✅${n}`:`${n}`, callback_data:`set_pp_${n}` })),
+      [1,2,3,4,5].map(n => ({ text: s.perPrompt===n?`✅ ${n}`:`${n}`, callback_data:`set_pp_${n}` })),
       [{ text: "◀️ Назад", callback_data: "do_batch" }],
     ]});
   }
-  if (data.startsWith("set_pp_")) { s.perPrompt = parseInt(data.replace("set_pp_","")); return bot.answerCallbackQuery(query.id, { text: `Установлено: ${s.perPrompt}` }); }
+  if (data.startsWith("set_pp_")) { s.perPrompt=parseInt(data.replace("set_pp_","")); return showBatchMenu(chatId, msgId); }
+  if (data === "batch_clear") { s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0; return showBatchMenu(chatId, msgId); }
+  if (data === "batch_run") { del(); return runBatch(chatId); }
 
-  if (data === "batch_run") {
-    del();
-    return runBatch(chatId);
+  // ── Навигация по промптам
+  if (data === "bp_prev") { s.batchPromptIdx = Math.max(0, (s.batchPromptIdx||0)-1); return showBatchMenu(chatId, msgId); }
+  if (data === "bp_next") { s.batchPromptIdx = Math.min(s.batchPrompts.length-1, (s.batchPromptIdx||0)+1); return showBatchMenu(chatId, msgId); }
+  if (data === "bp_delete") {
+    const idx = s.batchPromptIdx || 0;
+    s.batchPrompts.splice(idx, 1);
+    s.batchPromptIdx = Math.max(0, idx-1);
+    return showBatchMenu(chatId, msgId);
   }
 
-  // ── Модель изображения
+  // ── Модели
   if (data === "open_imgmodel") {
-    const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{
-      text: `${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`,
-      callback_data: `set_im_${k}`
-    }]);
-    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+    const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text:`${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_im_${k}` }]);
+    rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
     return edit("🎨 *Модель изображения:*", { inline_keyboard: rows });
   }
-  if (data.startsWith("set_im_")) { s.imgModel = data.replace("set_im_",""); del(); return showMainMenu(chatId); }
+  if (data.startsWith("set_im_")) { s.imgModel=data.replace("set_im_",""); del(); return showMainMenu(chatId); }
 
-  // ── Модель видео
   if (data === "open_vidmodel") {
-    const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{
-      text: `${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`,
-      callback_data: `set_vm_${k}`
-    }]);
-    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+    const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text:`${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_vm_${k}` }]);
+    rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
     return edit("🎥 *Модель видео:*", { inline_keyboard: rows });
   }
-  if (data.startsWith("set_vm_")) { s.vidModel = data.replace("set_vm_",""); del(); return showMainMenu(chatId); }
+  if (data.startsWith("set_vm_")) { s.vidModel=data.replace("set_vm_",""); del(); return showMainMenu(chatId); }
 
   // ── Соотношение
   if (data === "open_ratio") {
     const rows = [];
-    for (let i=0; i<RATIOS.length; i+=3) rows.push(RATIOS.slice(i,i+3).map(r => ({ text: s.ratio===r?`✅${r}`:r, callback_data:`set_r_${r.replace(":","x")}` })));
-    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
+    for (let i=0; i<RATIOS.length; i+=3) rows.push(RATIOS.slice(i,i+3).map(r => ({ text:s.ratio===r?`✅ ${r}`:r, callback_data:`set_r_${r.replace(":","x")}` })));
+    rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
     return edit("📐 *Соотношение сторон:*", { inline_keyboard: rows });
   }
-  if (data.startsWith("set_r_")) { s.ratio = data.replace("set_r_","").replace("x",":"); del(); return showMainMenu(chatId); }
+  if (data.startsWith("set_r_")) { s.ratio=data.replace("set_r_","").replace("x",":"); del(); return showMainMenu(chatId); }
 
-  // ── Количество
+  // ── Количество (ввод текстом до 500)
   if (data === "open_count") {
-    const rows = [];
-    for (let i=0; i<COUNTS.length; i+=4) rows.push(COUNTS.slice(i,i+4).map(c => ({ text: s.count===c?`✅${c}`:`${c}`, callback_data:`set_c_${c}` })));
-    rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
-    return edit("🔢 *Количество за раз:*", { inline_keyboard: rows });
+    s.step = "waiting_count";
+    return edit(
+      `🔢 *Количество за раз*\n\nСейчас: *${s.count}*\n\nНапиши число от 1 до 500:`,
+      { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel_count" }]] }
+    );
   }
-  if (data.startsWith("set_c_")) { s.count = parseInt(data.replace("set_c_","")); del(); return showMainMenu(chatId); }
+  if (data === "cancel_count") { s.step = null; del(); return showMainMenu(chatId); }
+  if (data.startsWith("set_c_")) { s.count=parseInt(data.replace("set_c_","")); del(); return showMainMenu(chatId); }
+
+  // ── Seed
+  if (data === "open_seed") {
+    return edit("🌱 *Seed:*", { inline_keyboard: [
+      [{ text:s.seed==="random"?"✅ Случайный":"Случайный", callback_data:"set_seed_random" }, { text:s.seed==="fixed"?"✅ Фиксированный":"Фиксированный", callback_data:"set_seed_fixed" }],
+      [{ text:"◀️ Назад", callback_data:"back_menu" }],
+    ]});
+  }
+  if (data === "set_seed_random") { s.seed="random"; del(); return showMainMenu(chatId); }
+  if (data === "set_seed_fixed") { s.seed="fixed"; del(); return showMainMenu(chatId); }
+
+  // ── Разрешение (для Grok Video)
+  if (data === "open_resolution") {
+    const RESOLUTIONS = ["480p","720p","1080p"];
+    return edit("🖥 *Разрешение Grok Video:*", { inline_keyboard: [
+      RESOLUTIONS.map(r => ({ text: (s.resolution||"720p")===r?`✅ ${r}`:r, callback_data:`set_res_${r}` })),
+      [{ text:"◀️ Назад", callback_data:"back_menu" }],
+    ]});
+  }
+  if (data.startsWith("set_res_")) { s.resolution=data.replace("set_res_",""); del(); return showMainMenu(chatId); }
 });
 
 // ─── Фото ─────────────────────────────────
@@ -366,76 +450,106 @@ bot.on("photo", async (msg) => {
   if (s.mode === "batch") {
     s.batchPhotos.push(fileId);
     return bot.sendMessage(chatId, `✅ Фото добавлено! Всего: ${s.batchPhotos.length} фото, ${s.batchPrompts.length} промптов`, {
-      reply_markup: { inline_keyboard: [
-        [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
-        [{ text: "❌ Отмена", callback_data: "back_menu" }],
-      ]}
+      reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch" }],[{ text:"🚀 Генерировать!", callback_data:"batch_run" }]] }
     });
   }
   if (s.step === "waiting_keyframe_start") {
-    s.keyframeStart = fileId;
-    s.step = "waiting_keyframe_end";
-    return bot.sendMessage(chatId, "✅ Первый кадр получен!\n\nТеперь отправь *второе* фото (конец видео) или нажми пропустить:", {
-      parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [
-        [{ text: "⏭ Пропустить (только начало)", callback_data: "kf_skip_end" }],
-        [{ text: "❌ Отмена", callback_data: "back_menu" }],
-      ]}
+    s.keyframeStart = fileId; s.step = "waiting_keyframe_end";
+    return bot.sendMessage(chatId, "✅ Первый кадр! Отправь второе фото или пропусти:", {
+      reply_markup: { inline_keyboard: [[{ text:"⏭ Пропустить", callback_data:"kf_skip_end" }],[{ text:"❌ Отмена", callback_data:"back_menu" }]] }
     });
   }
   if (s.step === "waiting_keyframe_end") {
-    s.keyframeEnd = fileId;
-    s.step = "waiting_prompt";
-    return bot.sendMessage(chatId, "✅ Оба кадра получены!\n\nТеперь напиши описание видео:", {
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+    s.keyframeEnd = fileId; s.step = "waiting_prompt";
+    return bot.sendMessage(chatId, "✅ Оба кадра! Напиши описание:", {
+      reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] }
     });
   }
   if (s.step === "waiting_photo") {
-    s.fileId = fileId;
-    s.step = "waiting_prompt";
-    return bot.sendMessage(chatId, "✅ Фото получено!\n\nНапиши описание:", {
-      reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+    s.fileId = fileId; s.step = "waiting_prompt";
+    return bot.sendMessage(chatId, "✅ Фото получено! Напиши описание:", {
+      reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] }
     });
   }
-
-  // Прислали фото без контекста
+  // No active step — set state for video-from-photo
   s.fileId = fileId; s.tab = "video_image"; s.step = "waiting_prompt"; s.mode = "normal";
-  bot.sendMessage(chatId, "✅ Фото получено! Буду делать видео.\n\nНапиши описание:", {
-    reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
+  const vm = VIDEO_MODELS[s.vidModel];
+  bot.sendMessage(chatId, `✅ Фото получено!
+
+🎬 *${vm.label}* (${vm.credits})
+
+Напиши описание для видео:`, {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: [
+      [{ text: "🎥 Сменить модель видео", callback_data: "open_vidmodel" }],
+      [{ text: "❌ Отмена", callback_data: "back_menu" }],
+    ]}
   });
 });
 
-// ─── Callback для ключевых кадров ─────────
-bot.on("callback_query", async (query) => {
-  if (query.data !== "kf_skip_end") return;
-  const chatId = query.message.chat.id;
+// ─── Документ (.txt файл) ─────────────────
+bot.on("document", async (msg) => {
+  const chatId = msg.chat.id;
   const s = getState(chatId);
-  bot.answerCallbackQuery(query.id);
-  s.step = "waiting_prompt";
-  bot.editMessageText("✅ Используется только начальный кадр.\n\nНапиши описание видео:", {
-    chat_id: chatId, message_id: query.message.message_id,
-    reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] }
-  });
+  if (s.step !== "waiting_txt_file") return;
+  if (!msg.document.file_name.endsWith(".txt")) return bot.sendMessage(chatId, "❌ Нужен .txt файл!");
+  s.step = null;
+
+  try {
+    const f = await bot.getFile(msg.document.file_id);
+    const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+    const text = Buffer.from(resp.data).toString("utf-8");
+    const prompts = text.split("\n").map(p => p.trim()).filter(Boolean);
+    const isImage = s.tab === "image";
+    const MAX_PROMPTS = isImage ? 500 : 15;
+    const available = MAX_PROMPTS - s.batchPrompts.length;
+    const toAdd = prompts.slice(0, available);
+    const skipped = prompts.length - toAdd.length;
+    s.batchPrompts.push(...toAdd);
+    s.batchPromptIdx = 0;
+    let reply = `✅ Загружено ${toAdd.length} промптов из файла!`;
+    if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped} — лимит ${MAX_PROMPTS} для ${isImage ? "фото" : "видео"}`;
+    bot.sendMessage(chatId, reply, {
+      reply_markup: { inline_keyboard: [[{ text:"📦 Открыть меню пакета", callback_data:"do_batch" }]] }
+    });
+  } catch(e) {
+    bot.sendMessage(chatId, `❌ Ошибка чтения файла: ${e.message}`);
+  }
 });
 
-// ─── Текст (промпт или пакетные промпты) ──
+// ─── Текстовые сообщения ──────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const s = getState(chatId);
   if (!msg.text || msg.text.startsWith("/")) return;
 
-  // Пакетные промпты из текста
+  if (s.step === "waiting_count") {
+    const n = parseInt(msg.text);
+    if (isNaN(n) || n < 1 || n > 500) {
+      return bot.sendMessage(chatId, "❌ Введи число от 1 до 500:", {
+        reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel_count" }]] }
+      });
+    }
+    s.count = n;
+    s.step = null;
+    await bot.sendMessage(chatId, `✅ Количество: *${n}*`, { parse_mode: "Markdown" });
+    return showMainMenu(chatId);
+  }
+
   if (s.step === "waiting_batch_prompts") {
     s.step = null;
+    const isImage = s.tab === "image";
+    const MAX_PROMPTS = isImage ? 500 : 15;
     const prompts = msg.text.split("\n").map(p => p.trim()).filter(Boolean);
-    s.batchPrompts.push(...prompts);
-    return bot.sendMessage(chatId, `✅ Добавлено ${prompts.length} промптов! Всего: ${s.batchPrompts.length}`, {
-      reply_markup: { inline_keyboard: [
-        [{ text: "✏️ Добавить ещё", callback_data: "batch_add_text" }],
-        [{ text: `🔢 На 1 промпт: ${s.perPrompt} вар.`, callback_data: "batch_per_prompt" }],
-        [{ text: "🚀 Генерировать!", callback_data: "batch_run" }],
-        [{ text: "❌ Отмена", callback_data: "back_menu" }],
-      ]}
+    const available = MAX_PROMPTS - s.batchPrompts.length;
+    const toAdd = prompts.slice(0, available);
+    const skipped = prompts.length - toAdd.length;
+    s.batchPrompts.push(...toAdd);
+    s.batchPromptIdx = Math.max(0, s.batchPrompts.length - toAdd.length);
+    let reply = `✅ Добавлено ${toAdd.length} промптов!`;
+    if (skipped > 0) reply += `\n⚠️ Пропущено ${skipped} — лимит ${MAX_PROMPTS} для ${isImage ? "фото" : "видео"}`;
+    return bot.sendMessage(chatId, reply, {
+      reply_markup: { inline_keyboard: [[{ text:"📦 Меню пакета", callback_data:"do_batch" }]] }
     });
   }
 
@@ -444,41 +558,24 @@ bot.on("message", async (msg) => {
   const prompt = msg.text;
   s.step = null;
 
-  if (s.mode === "keyframes") {
-    return runKeyframes(chatId, s, prompt);
-  }
-
+  if (s.mode === "keyframes") return runKeyframes(chatId, s, prompt);
   await runNormal(chatId, s, prompt);
 });
 
 // ─── Обычная генерация ────────────────────
 async function runNormal(chatId, s, prompt) {
   const isImage = s.tab === "image";
+  let model, endpoint;
+  if (isImage) { model = IMAGE_MODELS[s.imgModel]; endpoint = model.ep; }
+  else if (s.tab === "video_text") { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epT; }
+  else { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
+
   const count = s.count;
-  let model, endpoint, isImg = isImage;
-
-  if (isImage) {
-    model = IMAGE_MODELS[s.imgModel];
-    endpoint = model.ep;
-  } else if (s.tab === "video_text") {
-    model = VIDEO_MODELS[s.vidModel];
-    endpoint = model.epT;
-    isImg = false;
-  } else {
-    model = VIDEO_MODELS[s.vidModel];
-    endpoint = model.epI;
-    isImg = false;
-  }
-
-  const statusMsg = await bot.sendMessage(chatId,
-    `⏳ Запускаю ${count} задач...\n🎨 ${model.label}\n💳 ${model.credits}`
-  );
-
-  const tasks = Array.from({length: count}, (_,i) => genOne(chatId, s, prompt, endpoint, model, isImg, i+1, count, `${Date.now()}`));
+  const statusMsg = await bot.sendMessage(chatId, `⏳ Запускаю ${count} задач...\n🎨 ${model.label}\n💳 ${model.credits}`);
+  const tasks = Array.from({length:count}, (_,i) => genOne(chatId, s, prompt, endpoint, model, isImage, i+1, count));
   await bot.editMessageText(`⏳ ${count} задач запущено...`, { chat_id: chatId, message_id: statusMsg.message_id });
-
   const results = await Promise.allSettled(tasks);
-  const ok = results.filter(r => r.status==="fulfilled").length;
+  const ok = results.filter(r=>r.status==="fulfilled").length;
   await bot.editMessageText(`✅ Готово! ✓${ok}${count-ok>0?` ✗${count-ok}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
   showMainMenu(chatId);
 }
@@ -486,18 +583,17 @@ async function runNormal(chatId, s, prompt) {
 // ─── Ключевые кадры ───────────────────────
 async function runKeyframes(chatId, s, prompt) {
   const model = VIDEO_MODELS[s.vidModel];
-  const statusMsg = await bot.sendMessage(chatId, `⏳ Генерирую видео из ключевых кадров...\n🎥 ${model.label}`);
-
+  const statusMsg = await bot.sendMessage(chatId, `⏳ Ключевые кадры...\n🎥 ${model.label}`);
   try {
-    const body = { prompt, aspect_ratio: s.ratio };
+    const body = { prompt, aspect_ratio: s.ratio, ...(model.sub && { model: model.sub }) };
     if (s.keyframeStart) {
       const f = await bot.getFile(s.keyframeStart);
-      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.start_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
     }
     if (s.keyframeEnd) {
       const f = await bot.getFile(s.keyframeEnd);
-      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.end_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
     }
     const { data } = await axios.post(`${BASE_URL}${model.epK || model.epT}`, body, {
@@ -511,7 +607,7 @@ async function runKeyframes(chatId, s, prompt) {
       await sendMedia(chatId, result, false, `🎞 Ключ. кадры\n📝 _${prompt.slice(0,100)}_`);
     }
   } catch(e) {
-    await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+    await bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
   }
   showMainMenu(chatId);
 }
@@ -521,85 +617,70 @@ async function runBatch(chatId) {
   const s = getState(chatId);
   const isImage = s.tab === "image";
   const model = isImage ? IMAGE_MODELS[s.imgModel] : VIDEO_MODELS[s.vidModel];
-  const prompts = s.batchPrompts;
-  const photos = s.batchPhotos;
+  const prompts = [...s.batchPrompts];
+  const photos = [...s.batchPhotos];
   const perPrompt = s.perPrompt || 1;
 
-  if (prompts.length === 0 && photos.length === 0) {
-    return bot.sendMessage(chatId, "❌ Добавь хотя бы один промпт или фото!");
-  }
+  if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
 
   const tasks = [];
-
-  // Промпты
   for (let pi=0; pi<prompts.length; pi++) {
-    const prompt = prompts[pi];
     for (let vi=0; vi<perPrompt; vi++) {
-      const idx = `${pi+1}.${vi+1}`;
-      const ep = isImage ? model.ep : model.epT;
-      tasks.push({ prompt, idx, ep, isImg: isImage, fileId: null });
+      tasks.push({ prompt: prompts[pi], idx: `${pi+1}.${vi+1}`, ep: isImage ? model.ep : model.epT, isImg: isImage, fileId: null });
     }
   }
-
-  // Фото
   for (let fi=0; fi<photos.length; fi++) {
-    const fileId = photos[fi];
     for (let vi=0; vi<perPrompt; vi++) {
-      const idx = `${prompts.length+fi+1}.${vi+1}`;
-      const ep = VIDEO_MODELS[s.vidModel].epI;
-      tasks.push({ prompt: "animate", idx, ep, isImg: false, fileId });
+      tasks.push({ prompt: "animate", idx: `${prompts.length+fi+1}.${vi+1}`, ep: VIDEO_MODELS[s.vidModel].epI, isImg: false, fileId: photos[fi] });
     }
   }
 
   const total = tasks.length;
+  let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
-    `📦 *Пакетный режим*\n\n` +
-    `Всего задач: ${total}\n` +
-    `Модель: ${model.label}\n` +
-    `💳 ${model.credits}`,
+    `📦 *Пакетный режим*\nЗадач: ${total} | Модель: ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" }
   );
 
-  let done = 0, errors = 0;
-  // Запускаем группами по 5 (лимит потоков)
+  // Живое обновление баланса параллельно
+  const balanceMsg = await bot.sendMessage(chatId, "📊 _Обновляю баланс..._", { parse_mode: "Markdown" });
+  liveBalanceUpdate(chatId, balanceMsg.message_id, 15000, total * 60000).catch(()=>{});
+
   for (let i=0; i<tasks.length; i+=5) {
     const batch = tasks.slice(i, i+5);
     await Promise.allSettled(batch.map(async (task) => {
       try {
         await genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId);
         done++;
-      } catch(e) { errors++; }
+      } catch { errors++; }
       await bot.editMessageText(
-        `📦 Пакетная генерация\n\n✓ ${done} / ${total}${errors>0?` | ✗ ${errors}`:""}`,
+        `📦 Пакет: ✓${done}/${total}${errors>0?` | ✗${errors}`:""}`,
         { chat_id: chatId, message_id: statusMsg.message_id }
       ).catch(()=>{});
     }));
   }
 
   await bot.editMessageText(`✅ Пакет готов! ✓${done}${errors>0?` ✗${errors}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
-  s.batchPrompts = []; s.batchPhotos = [];
+  s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0;
   showMainMenu(chatId);
 }
 
 // ─── Одна задача ──────────────────────────
-async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx = null, overrideFileId = null) {
-  const label = batchIdx || (total > 1 ? `${index}/${total}` : "");
-  const displayIdx = batchIdx || (total > 1 ? index.toString() : "");
+async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx=null, overrideFileId=null) {
+  const label = batchIdx || (total>1 ? `${index}/${total}` : "");
   try {
     const body = {
-      prompt,
-      aspect_ratio: s.ratio,
+      prompt, aspect_ratio: s.ratio,
       ...(model.sub && { model: model.sub }),
       ...(model.model && { model: model.model }),
       ...(model.quality && { quality: model.quality }),
-      ...(model.res && { resolution: s.resolution }),
+      ...(model.res && { resolution: s.resolution || model.defaultRes || "720p" }),
       ...(s.seed === "fixed" && { seed: 42 }),
     };
-
     const fid = overrideFileId || s.fileId;
-    if (fid && (s.tab === "video_image" || overrideFileId)) {
+    if (fid && (s.tab==="video_image" || overrideFileId)) {
       const f = await bot.getFile(fid);
-      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
       body.image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
     }
 
@@ -611,53 +692,42 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     const opId = data.operation_id || data.task_id || data.id;
     if (!opId) throw new Error("Нет ID задачи");
 
-    const result = await pollResult(opId);
-    const idxLabel = displayIdx ? `*${displayIdx}*` : "";
-    const caption = `${idxLabel ? idxLabel+"\n" : ""}${model.label}\n📝 _${prompt.slice(0,100)}_`;
+    addHistory(chatId, { index: batchIdx||label, model: model.label, prompt, opId, endpoint, body, isImage });
 
-    addHistory(chatId, {
-      index: displayIdx || label,
-      model: model.label,
-      prompt,
-      opId,
-      endpoint,
-      body,
-      isImage,
-    });
+    const result = await pollResult(opId);
+    const idxStr = batchIdx ? `*${batchIdx}* ` : "";
+    const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0,100)}_`;
 
     if (result) {
-      await sendMedia(chatId, result, isImage, caption);
+      const regenKb = { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`regen_0` }]] };
+      await sendMedia(chatId, result, isImage, caption, regenKb);
     } else {
-      await bot.sendMessage(chatId,
-        `⏰ ${idxLabel} не успело.\nID: \`${opId}\`\n/check ${opId}`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: `regen_${opId}_0` }]] }
-        }
-      );
+      await bot.sendMessage(chatId, `⏰ ${idxStr}не успело.\nID: \`${opId}\`\n/check ${opId}`, {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text:"🔄 Повторить", callback_data:`regen_0` }]] }
+      });
     }
   } catch(e) {
     const errMsg = e.response?.data?.detail || e.response?.data?.message || e.message;
-    await bot.sendMessage(chatId,
-      `❌ ${label ? `[${label}] ` : ""}Ошибка: ${errMsg}`,
-      { reply_markup: { inline_keyboard: [[{ text: "🔄 Повторить", callback_data: `retry_${label}` }]] } }
-    );
+    await bot.sendMessage(chatId, `❌ ${label?`[${label}] `:""}${errMsg}`, {
+      reply_markup: { inline_keyboard: [[{ text:"🔄 Повторить запрос", callback_data:"back_menu" }]] }
+    });
     throw e;
   }
 }
 
 // ─── /check ───────────────────────────────
 async function checkOperation(chatId, opId) {
-  const msg = await bot.sendMessage(chatId, `🔍 Проверяю \`${opId}\`...`, { parse_mode: "Markdown" });
+  const msg = await bot.sendMessage(chatId, `🔍 Проверяю \`${opId}\`...`, { parse_mode:"Markdown" });
   try {
     const { data } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
       headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
     });
     const st = data.status || data.state;
-    await bot.editMessageText(`Статус: *${st}*`, { chat_id: chatId, message_id: msg.message_id, parse_mode: "Markdown" });
+    await bot.editMessageText(`Статус: *${st}*`, { chat_id: chatId, message_id: msg.message_id, parse_mode:"Markdown" });
     if (["completed","success","done","finished"].includes(st)) {
       const media = extractMedia(data);
-      if (media) await sendMedia(chatId, media, data.media_type === "image", "✅ Результат");
+      if (media) await sendMedia(chatId, media, data.media_type==="image", "✅ Результат");
     }
   } catch(e) {
     await bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: msg.message_id });
