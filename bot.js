@@ -198,17 +198,27 @@ function formatBalance(usage) {
 }
 
 async function showBalance(chatId, msgId = null) {
-  const usage = await getUsageData();
-  const text = formatBalance(usage);
-  const kb = { inline_keyboard: [
-    [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
-    [{ text: "◀️ Назад", callback_data: "close_balance" }],
-  ]};
-  if (msgId) {
-    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  } else {
-    const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-    getState(chatId).balanceMsgId = m.message_id;
+  try {
+    const usage = await getUsageData();
+    const text = formatBalance(usage);
+    const kb = { inline_keyboard: [
+      [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
+      [{ text: "◀️ Назад", callback_data: "close_balance" }],
+    ]};
+    if (msgId) {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+    } else {
+      const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+      getState(chatId).balanceMsgId = m.message_id;
+    }
+  } catch(e) {
+    console.error("[showBalance error]", e.message);
+    const errText = `❌ Ошибка баланса: ${e.message}`;
+    if (msgId) {
+      await bot.editMessageText(errText, { chat_id: chatId, message_id: msgId }).catch(()=>{});
+    } else {
+      await bot.sendMessage(chatId, errText);
+    }
   }
 }
 
@@ -379,8 +389,8 @@ bot.on("callback_query", async (query) => {
 
   // ── Баланс
   if (data === "close_balance") { return del(); }
-  if (data === "show_balance") { return showBalance(chatId); }
-  if (data === "refresh_balance") return showBalance(chatId, msgId);
+  if (data === "show_balance") { return await showBalance(chatId); }
+  if (data === "refresh_balance") { return await showBalance(chatId, msgId); }
 
   // ── История
   if (data === "show_history") { return showHistoryMenu(chatId, msgId); }
