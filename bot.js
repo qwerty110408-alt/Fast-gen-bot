@@ -256,7 +256,7 @@ function spendBalance(type, amount = 1) {
   saveJSON(BALANCE_FILE, balanceState);
 }
 
-async function formatBalance() {
+function formatBalance() {
   checkResetBalance();
   const b = balanceState;
   const imgLeft = Math.max(0, HOURLY_LIMITS.images - b.images);
@@ -275,31 +275,12 @@ async function formatBalance() {
     return String(n);
   }
 
-  // Пробуем получить реальные данные с API
-  let realBlock = "";
-  try {
-    const usage = await fetchRealUsage();
-    if (usage) {
-      const lim = usage.account_limits || {};
-      const cur = usage.current_usage || {};
-      const threads = cur.active_threads || {};
-      const hourly = cur.hourly_usage || {};
-      realBlock =
-        `\n📡 *Реальный баланс API:*\n` +
-        `🖼 Лимит фото/час: *${lim.img_gen_per_hour_limit || "?"}*\n` +
-        `🎬 Лимит видео/час: *${lim.video_gen_per_hour_limit || "?"}*\n` +
-        `💬 Токенов/час: *${fmtTok(lim.prompt_tokens_per_hour_limit || 0)}*\n` +
-        `⚡ Активных потоков: фото=${threads.image_threads || 0}, видео=${threads.video_threads || 0}\n`;
-    }
-  } catch(e) {}
-
   return (
     `📊 *Баланс и лимиты* (общий)\n\n` +
     `🖼 Изображения: *${imgLeft}/${HOURLY_LIMITS.images}*\n` +
     `🎬 Видео: *${vidLeft}/${HOURLY_LIMITS.videos}*\n` +
     `💬 Токены промптов: *${fmtTok(tokLeft)}/${fmtTok(HOURLY_LIMITS.tokens)}*\n` +
     `⏱ Сброс через: *${resetStr}* (в ${resetTime})\n` +
-    realBlock +
     `\nСтоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
@@ -462,7 +443,7 @@ async function pollResult(opId, max=90, interval=10000) {
 // ─── Баланс UI ────────────────────────────
 async function showBalance(chatId, msgId = null) {
   const s = getState(chatId);
-  const text = await formatBalance();
+  const text = formatBalance();
   const kb = { inline_keyboard: [
     [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
     [{ text: "🔴 Отменить все задачи", callback_data: "cancel_all_ops" }],
@@ -512,15 +493,11 @@ async function showMainMenu(chatId) {
   const kb = { inline_keyboard: [
     [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "do_image_ref" }],
     [{ text: "🎬 Видео из текста", callback_data: "do_vtext" }, { text: "📸 Видео из фото", callback_data: "do_vimage" }],
-    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }, { text: "🎨 Remix", callback_data: "do_remix" }],
+    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
     [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
     [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
     [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
-    [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
-    ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
-    [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
-    [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
-    [{ text: "📋 История", callback_data: "show_history" }],
+    [{ text: "📊 Баланс", callback_data: "show_balance" }, { text: "⚙️ Прочее", callback_data: "open_misc" }],
   ]};
 
   if (s.menuMsgId) {
@@ -744,6 +721,24 @@ function showEnhanceMenu(chatId, msgId = null) {
     [{ text: mode==="always" ? "✅ Всегда улучшать" : "Всегда улучшать", callback_data: "enhance_always" }],
     [{ text: mode==="ask"    ? "✅ Спрашивать каждый раз" : "Спрашивать каждый раз", callback_data: "enhance_ask" }],
     [{ text: mode==="never"  ? "✅ Никогда (оригинальный)" : "Никогда (оригинальный)", callback_data: "enhance_never" }],
+    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+// ─── Меню "Прочее" ────────────────────────
+function showMiscMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const enhanceLabel = { always: "✨ Всегда", never: "⏭ Никогда", ask: "❓ Спрашивать" }[s.enhanceMode || "ask"];
+  const seedLabel = s.seed === "fixed" ? "🔒 Фикс." : "🎲 Случ.";
+  const text = `⚙️ *Прочее*`;
+  const kb = { inline_keyboard: [
+    [{ text: `🌱 Seed: ${seedLabel}`, callback_data: "open_seed" }, { text: "🎨 Remix", callback_data: "do_remix" }],
+    ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+    [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
+    [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
+    [{ text: "📋 История", callback_data: "show_history" }],
     [{ text: "◀️ Назад", callback_data: "back_menu" }],
   ]};
   if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
@@ -1207,6 +1202,7 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("set_res_")) { s.resolution=data.replace("set_res_",""); saveState(chatId); del(); return showMainMenu(chatId); }
 
   // ── Улучшение промпта — настройки
+  if (data === "open_misc")   { return showMiscMenu(chatId, msgId); }
   if (data === "open_enhance") { return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_always") { s.enhanceMode="always"; saveState(chatId); return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_ask")    { s.enhanceMode="ask";    saveState(chatId); return showEnhanceMenu(chatId, msgId); }
@@ -1219,19 +1215,31 @@ bot.on("callback_query", async (query) => {
     const genKey = s.pendingGenKey;
     const genFn = pendingGenerators.get(genKey);
     if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
-    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null;
+    s.pendingMsgId = null;
     if (!genFn || !rawPrompt) return showMainMenu(chatId);
     const waitMsg = await bot.sendMessage(chatId, "✨ Улучшаю промпт...");
     const enhanced = await enhancePrompt(rawPrompt, isVideo);
     await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
     if (enhanced && enhanced !== rawPrompt) {
-      await bot.sendMessage(chatId,
-        `✨ *Промпт улучшен:*\n_${enhanced.slice(0,300)}${enhanced.length>300?"...":""}_`,
-        { parse_mode: "Markdown" }
+      s.pendingEnhancedPrompt = enhanced;
+      const choiceMsg = await bot.sendMessage(chatId,
+        `✨ *Промпт улучшен!*\n\n` +
+        `📝 *Оригинал:*\n_${rawPrompt.slice(0, 150)}${rawPrompt.length > 150 ? "..." : ""}_\n\n` +
+        `✨ *Улучшенный:*\n_${enhanced.slice(0, 300)}${enhanced.length > 300 ? "..." : ""}_\n\n` +
+        `Выбери версию для генерации:`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [
+            [{ text: "✨ Использовать улучшенный", callback_data: "enhance_use_enhanced" }],
+            [{ text: "📝 Оставить оригинал", callback_data: "enhance_use_original" }],
+          ]}
+        }
       );
-      pendingGenerators.delete(genKey);
-      return genFn(enhanced);
+      s.pendingMsgId = choiceMsg.message_id;
+      return;
     }
+    // Улучшение не дало результата — используем оригинал
+    s.pendingPrompt = null; s.pendingGenKey = null; s.pendingEnhancedPrompt = null;
     pendingGenerators.delete(genKey);
     return genFn(rawPrompt);
   }
@@ -1240,7 +1248,27 @@ bot.on("callback_query", async (query) => {
     const genKey = s.pendingGenKey;
     const genFn = pendingGenerators.get(genKey);
     if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
-    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null;
+    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null; s.pendingEnhancedPrompt = null;
+    if (!genFn || !rawPrompt) return showMainMenu(chatId);
+    pendingGenerators.delete(genKey);
+    return genFn(rawPrompt);
+  }
+  if (data === "enhance_use_enhanced") {
+    const enhanced = s.pendingEnhancedPrompt;
+    const genKey = s.pendingGenKey;
+    const genFn = pendingGenerators.get(genKey);
+    if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
+    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null; s.pendingEnhancedPrompt = null;
+    if (!genFn || !enhanced) return showMainMenu(chatId);
+    pendingGenerators.delete(genKey);
+    return genFn(enhanced);
+  }
+  if (data === "enhance_use_original") {
+    const rawPrompt = s.pendingPrompt;
+    const genKey = s.pendingGenKey;
+    const genFn = pendingGenerators.get(genKey);
+    if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
+    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null; s.pendingEnhancedPrompt = null;
     if (!genFn || !rawPrompt) return showMainMenu(chatId);
     pendingGenerators.delete(genKey);
     return genFn(rawPrompt);
@@ -1548,11 +1576,28 @@ async function handlePromptAndGenerate(chatId, s, rawPrompt, generatorFn) {
     const enhanced = await enhancePrompt(rawPrompt, isVideo);
     await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
     if (enhanced && enhanced !== rawPrompt) {
-      await bot.sendMessage(chatId,
-        `✨ *Промпт улучшен:*\n_${enhanced.slice(0, 300)}${enhanced.length > 300 ? "..." : ""}_`,
-        { parse_mode: "Markdown" }
+      // Показываем улучшенный промпт и даём выбор
+      const genKey = `gen_${Date.now()}`;
+      pendingGenerators.set(genKey, generatorFn);
+      s.pendingPrompt = rawPrompt;
+      s.pendingEnhancedPrompt = enhanced;
+      s.pendingIsVideo = isVideo;
+      s.pendingGenKey = genKey;
+      const previewMsg = await bot.sendMessage(chatId,
+        `✨ *Промпт улучшен!*\n\n` +
+        `📝 *Оригинал:*\n_${rawPrompt.slice(0, 150)}${rawPrompt.length > 150 ? "..." : ""}_\n\n` +
+        `✨ *Улучшенный:*\n_${enhanced.slice(0, 300)}${enhanced.length > 300 ? "..." : ""}_\n\n` +
+        `Выбери версию для генерации:`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [
+            [{ text: "✨ Использовать улучшенный", callback_data: "enhance_use_enhanced" }],
+            [{ text: "📝 Оставить оригинал", callback_data: "enhance_use_original" }],
+          ]}
+        }
       );
-      return generatorFn(enhanced);
+      s.pendingMsgId = previewMsg.message_id;
+      return;
     }
     return generatorFn(rawPrompt);
   }
@@ -1568,6 +1613,7 @@ async function handlePromptAndGenerate(chatId, s, rawPrompt, generatorFn) {
   );
   // Сохраняем промпт и коллбэк в состояние
   s.pendingPrompt = rawPrompt;
+  s.pendingEnhancedPrompt = null;
   s.pendingIsVideo = isVideo;
   s.pendingMsgId = previewMsg.message_id;
   s.pendingGenKey = `gen_${Date.now()}`;
@@ -1671,7 +1717,9 @@ async function runRemix(chatId, s, prompt) {
       aspect_ratio: s.ratio,
       ...(s.seed === "fixed" && { seed: 42 }),
     };
-    const { data } = await axios.post(`${BASE_URL}/api/v4/flow/image/remix`, body, {
+    console.log(`[remix] body prompt="${prompt.slice(0,50)}" refs=${referenceImages.length} ratio=${s.ratio}`);
+    referenceImages.forEach((ri, i) => console.log(`[remix] ref[${i}] category=${ri.category} image_type=${ri.image.startsWith("file:")?"file_ref":ri.image.startsWith("data:")?"base64":"unknown"} len=${ri.image.length}`));
+    const { data } = await axios.post(`${BASE_URL}/api/v5/google-fx/remix`, body, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
       timeout: 120000,
     });
@@ -1686,8 +1734,10 @@ async function runRemix(chatId, s, prompt) {
       await sendMedia(chatId, result, true, `🎨 Remix\n📝 _${prompt.slice(0, 100)}_`, regenKb);
     }
   } catch(e) {
-    const errStr = e.response?.data?.detail || e.message;
-    await bot.editMessageText(`❌ Remix ошибка: ${String(errStr).slice(0,200)}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
+    const errStr = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
+    const status = e.response?.status ? `[${e.response.status}] ` : "";
+    console.error(`[remix ERROR] ${status}${JSON.stringify(e.response?.data || {}).slice(0,500)}`);
+    await bot.editMessageText(`❌ Remix ошибка: ${status}${String(errStr).slice(0,200)}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
   }
   s.remixImages = [];
   showMainMenu(chatId);
