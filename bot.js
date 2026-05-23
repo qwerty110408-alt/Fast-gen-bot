@@ -41,7 +41,8 @@ function getState(chatId) {
     batchPromptIdx: 0, // текущий индекс просмотра промпта
     keyframeStart: null, keyframeEnd: null,
     fileId: null,
-    balanceMsgId: null, // для live-обновления баланса
+    balanceMsgId: null,
+    menuMsgId: null, // ID последнего меню для замены
   };
   return userState[chatId];
 }
@@ -201,7 +202,7 @@ async function showBalance(chatId, msgId = null) {
   const text = formatBalance(usage);
   const kb = { inline_keyboard: [
     [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
-    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+    [{ text: "◀️ Назад", callback_data: "close_balance" }],
   ]};
   if (msgId) {
     await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
@@ -221,7 +222,7 @@ async function liveBalanceUpdate(chatId, msgId, intervalMs = 15000, durationMs =
     try {
       await bot.editMessageText(formatBalance(usage), {
         chat_id: chatId, message_id: msgId, parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "refresh_balance" }],[{ text: "◀️ Назад", callback_data: "back_menu" }]] }
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "refresh_balance" }],[{ text: "◀️ Назад", callback_data: "close_balance" }]] }
       });
     } catch {}
   }
@@ -247,26 +248,37 @@ function showHistoryMenu(chatId, msgId = null) {
 }
 
 // ─── Главное меню ─────────────────────────
-function showMainMenu(chatId) {
+async function showMainMenu(chatId) {
   const s = getState(chatId);
   const im = IMAGE_MODELS[s.imgModel];
   const vm = VIDEO_MODELS[s.vidModel];
-  bot.sendMessage(chatId,
+  const text =
     `🤖 *FastGen Bot*\n\n` +
     `🖼 Фото: *${im.label}*\n└ ${im.credits}\n` +
     `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
-    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`,
-    { parse_mode: "Markdown", reply_markup: { inline_keyboard: [
-      [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🎬 Видео из текста", callback_data: "do_vtext" }],
-      [{ text: "📸 Видео из фото", callback_data: "do_vimage" }, { text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
-      [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
-      [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
-      [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
-      [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
-      ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
-      [{ text: "📋 История", callback_data: "show_history" }],
-    ]}}
-  );
+    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`;
+  const kb = { inline_keyboard: [
+    [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🎬 Видео из текста", callback_data: "do_vtext" }],
+    [{ text: "📸 Видео из фото", callback_data: "do_vimage" }, { text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
+    [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
+    [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
+    [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
+    [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
+    ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+    [{ text: "📋 История", callback_data: "show_history" }],
+  ]};
+
+  // Try to edit existing menu message
+  if (s.menuMsgId) {
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: s.menuMsgId, parse_mode: "Markdown", reply_markup: kb });
+      return;
+    } catch(e) {
+      // Message too old or deleted — send new one
+    }
+  }
+  const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+  s.menuMsgId = m.message_id;
 }
 
 // ─── Промпт-навигатор для пакетного режима ─
@@ -319,8 +331,24 @@ function showBatchPhotosMenu(chatId, msgId) {
 }
 
 // ─── /start /menu ─────────────────────────
-bot.onText(/\/start/, (msg) => { userState[msg.chat.id]=null; showMainMenu(msg.chat.id); });
-bot.onText(/\/menu/, (msg) => showMainMenu(msg.chat.id));
+bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  const s = getState(chatId);
+  // Try delete old menu
+  if (s.menuMsgId) {
+    await bot.deleteMessage(chatId, s.menuMsgId).catch(()=>{});
+    s.menuMsgId = null;
+  }
+  // Try delete the /start command message
+  await bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+  userState[chatId] = null;
+  showMainMenu(chatId);
+});
+bot.onText(/\/menu/, async (msg) => {
+  const chatId = msg.chat.id;
+  await bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+  showMainMenu(chatId);
+});
 bot.onText(/\/balance/, (msg) => showBalance(msg.chat.id));
 bot.onText(/\/history/, (msg) => showHistoryMenu(msg.chat.id));
 bot.onText(/\/check (.+)/, async (msg, m) => checkOperation(msg.chat.id, m[1].trim()));
@@ -337,11 +365,21 @@ bot.on("callback_query", async (query) => {
   const edit = (text, kb) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb });
   const cancelKb = { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "back_menu" }]] };
 
-  if (data === "back_menu") { del(); return showMainMenu(chatId); }
+  if (data === "back_menu") {
+    // If this message IS the main menu — just refresh it
+    const s2 = getState(chatId);
+    if (s2.menuMsgId === msgId) {
+      return showMainMenu(chatId);
+    }
+    // Otherwise delete this sub-menu and restore main menu
+    del();
+    return showMainMenu(chatId);
+  }
   if (data === "noop") return;
 
   // ── Баланс
-  if (data === "show_balance") { del(); return showBalance(chatId); }
+  if (data === "close_balance") { return del(); }
+  if (data === "show_balance") { return showBalance(chatId); }
   if (data === "refresh_balance") return showBalance(chatId, msgId);
 
   // ── История
