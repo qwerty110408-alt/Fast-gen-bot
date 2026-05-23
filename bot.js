@@ -258,84 +258,6 @@ function showHistoryMenu(chatId, msgId = null) {
   else bot.sendMessage(chatId, "📋 *История:*", opts);
 }
 
-// ─── Подменю для кнопок (как панель снизу) ───────────────────────────────────
-
-function showImageSubmenu(chatId, msgId) {
-  const s = getState(chatId);
-  const im = IMAGE_MODELS[s.imgModel];
-  const text =
-    `🖼️ *Изображение*\n\n` +
-    `🎨 Модель: *${im.label}*\n` +
-    `💳 ${im.credits}\n` +
-    `📐 Соотношение: *${s.ratio}*\n` +
-    `🔢 Количество: *${s.count}* шт.\n` +
-    `🌱 Seed: *${s.seed === "fixed" ? "Фикс." : "Случ."}*`;
-  const kb = { inline_keyboard: [
-    [{ text: "✏️ Ввести промпт", callback_data: "submenu_do_image" }],
-    [{ text: "🎨 Сменить модель", callback_data: "open_imgmodel" }, { text: "📐 Соотношение", callback_data: "open_ratio" }],
-    [{ text: "🔢 Количество", callback_data: "open_count" }, { text: "🌱 Seed", callback_data: "open_seed" }],
-    [{ text: "◀️ Назад", callback_data: "back_menu" }],
-  ]};
-  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-}
-
-function showImageRefSubmenu(chatId, msgId) {
-  const s = getState(chatId);
-  const im = IMAGE_MODELS[s.imgModel];
-  const text =
-    `🖼️📸 *Фото из рефов*\n\n` +
-    `🎨 Модель: *${im.label}*\n` +
-    `💳 ${im.credits}\n` +
-    `📐 Соотношение: *${s.ratio}*\n\n` +
-    `Отправь референсные фото, затем напиши промпт.`;
-  const kb = { inline_keyboard: [
-    [{ text: "▶️ Начать — отправить рефы", callback_data: "submenu_do_image_ref" }],
-    [{ text: "🎨 Сменить модель", callback_data: "open_imgmodel" }, { text: "📐 Соотношение", callback_data: "open_ratio" }],
-    [{ text: "◀️ Назад", callback_data: "back_menu" }],
-  ]};
-  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-}
-
-function showVideoTextSubmenu(chatId, msgId) {
-  const s = getState(chatId);
-  const vm = VIDEO_MODELS[s.vidModel];
-  const text =
-    `🎬 *Видео из текста*\n\n` +
-    `🎥 Модель: *${vm.label}*\n` +
-    `💳 ${vm.credits}\n` +
-    `📐 Соотношение: *${s.ratio}*\n` +
-    `🌱 Seed: *${s.seed === "fixed" ? "Фикс." : "Случ."}*`;
-  const kb = { inline_keyboard: [
-    [{ text: "✏️ Ввести промпт", callback_data: "submenu_do_vtext" }],
-    [{ text: "🎥 Сменить модель", callback_data: "open_vidmodel" }, { text: "📐 Соотношение", callback_data: "open_ratio" }],
-    [{ text: "🌱 Seed", callback_data: "open_seed" }],
-    [{ text: "◀️ Назад", callback_data: "back_menu" }],
-  ]};
-  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-}
-
-function showVideoImageSubmenu(chatId, msgId) {
-  const s = getState(chatId);
-  const vm = VIDEO_MODELS[s.vidModel];
-  const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
-  const text =
-    `📸 *Видео из фото*\n\n` +
-    `🎥 Модель: *${vm.label}*\n` +
-    `💳 ${vm.credits}\n` +
-    `📐 Соотношение: *${s.ratio}*\n\n` +
-    `Можно отправить до *${maxVidRef}* фото.`;
-  const kb = { inline_keyboard: [
-    [{ text: "▶️ Начать — отправить фото", callback_data: "submenu_do_vimage" }],
-    [{ text: "🎥 Сменить модель", callback_data: "open_vidmodel" }, { text: "📐 Соотношение", callback_data: "open_ratio" }],
-    [{ text: "◀️ Назад", callback_data: "back_menu" }],
-  ]};
-  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
-  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
-}
-
 // ─── Главное меню ─────────────────────────
 async function showMainMenu(chatId) {
   const s = getState(chatId);
@@ -347,13 +269,13 @@ async function showMainMenu(chatId) {
     `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
     `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`;
   const kb = { inline_keyboard: [
-    [{ text: "🖼️ Изображение", callback_data: "sub_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "sub_image_ref" }],
-    [{ text: "🎬 Видео из текста", callback_data: "sub_vtext" }, { text: "📸 Видео из фото", callback_data: "sub_vimage" }],
+    [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "do_image_ref" }],
+    [{ text: "🎬 Видео из текста", callback_data: "do_vtext" }, { text: "📸 Видео из фото", callback_data: "do_vimage" }],
     [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
     [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
-    [{ text: "🎨 Модель фото", callback_data: "sub_imgmodel" }, { text: "🎥 Модель видео", callback_data: "sub_vidmodel" }],
+    [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
     [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
-    [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "sub_balance" }],
+    [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
     ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
     [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
     [{ text: "📋 История", callback_data: "show_history" }],
@@ -571,10 +493,23 @@ async function runPromptGen(chatId, storyText) {
   showBatchMenu(chatId);
 }
 
+// ─── Reply Keyboard (постоянная клавиатура) ───
+const REPLY_KEYBOARD = {
+  keyboard: [
+    [{ text: "🖼️ Изображение" }, { text: "🖼️📸 Фото из рефов" }],
+    [{ text: "🎬 Видео из текста" }, { text: "📸 Видео из фото" }],
+    [{ text: "🎨 Модель фото" },    { text: "🎥 Модель видео" }],
+    [{ text: "📊 Баланс" }],
+  ],
+  resize_keyboard: true,
+  persistent: true,
+};
+
 // ─── /start /menu ─────────────────────────
 bot.onText(/\/start|\/menu/, (msg) => {
   const chatId = msg.chat.id;
   getState(chatId); // инициализация
+  bot.sendMessage(chatId, "⌨️ Клавиатура активирована!", { reply_markup: REPLY_KEYBOARD });
   showMainMenu(chatId);
 });
 
@@ -605,46 +540,6 @@ bot.on("callback_query", async (query) => {
   if (data === "show_balance")   { return showBalance(chatId); }
   if (data === "refresh_balance") { return showBalance(chatId, msgId); }
   if (data === "show_history")   { del(); return showHistoryMenu(chatId); }
-
-  // ── Подменю (открываются из главного меню)
-  if (data === "sub_image")     { return showImageSubmenu(chatId, msgId); }
-  if (data === "sub_image_ref") { return showImageRefSubmenu(chatId, msgId); }
-  if (data === "sub_vtext")     { return showVideoTextSubmenu(chatId, msgId); }
-  if (data === "sub_vimage")    { return showVideoImageSubmenu(chatId, msgId); }
-  if (data === "sub_imgmodel")  {
-    const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text:`${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_im_${k}` }]);
-    rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-    return edit("🎨 *Модель фото:*", { inline_keyboard: rows });
-  }
-  if (data === "sub_vidmodel")  {
-    const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text:`${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_vm_${k}` }]);
-    rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
-    return edit("🎥 *Модель видео:*", { inline_keyboard: rows });
-  }
-  if (data === "sub_balance")   { return showBalance(chatId); }
-
-  // ── Действия из подменю (ведут к промпту)
-  if (data === "submenu_do_image")     { s.step="waiting_prompt"; s.tab="image"; s.mode="normal"; return edit(`🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, cancelKb); }
-  if (data === "submenu_do_image_ref") {
-    s.pendingRefImages = []; s.tab="image_ref"; s.mode="normal"; s.step="waiting_ref_photos";
-    return edit("🖼️📸 *Изображение из референсов*\n\nОтправь до 10 фото по одному.\nКогда добавишь все — нажми кнопку:", {
-      inline_keyboard: [
-        [{ text: "✅ Референсы готовы, ввести промпт", callback_data: "ref_photos_done" }],
-        [{ text: "◀️ Назад", callback_data: "sub_image_ref" }],
-      ]
-    });
-  }
-  if (data === "submenu_do_vtext")  { s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal"; return edit(`🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, cancelKb); }
-  if (data === "submenu_do_vimage") {
-    const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
-    s.pendingRefImages = []; s.tab="video_ref"; s.mode="normal"; s.step="waiting_vid_ref_photos";
-    return edit(`📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:`, {
-      inline_keyboard: [
-        [{ text: "✅ Фото готовы, ввести промпт", callback_data: "vid_ref_photos_done" }],
-        [{ text: "◀️ Назад", callback_data: "sub_vimage" }],
-      ]
-    });
-  }
 
   // ── История
   if (data.startsWith("hist_")) {
@@ -975,6 +870,56 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const s = getState(chatId);
   if (!msg.text || msg.text.startsWith("/")) return;
+
+  // ── Кнопки Reply Keyboard
+  const replyMap = {
+    "🖼️ Изображение":     "do_image",
+    "🖼️📸 Фото из рефов": "do_image_ref",
+    "🎬 Видео из текста": "do_vtext",
+    "📸 Видео из фото":   "do_vimage",
+    "🎨 Модель фото":     "open_imgmodel",
+    "🎥 Модель видео":    "open_vidmodel",
+    "📊 Баланс":          "show_balance",
+  };
+  if (replyMap[msg.text]) {
+    s.step = null;
+    const action = replyMap[msg.text];
+    if (action === "show_balance") return showBalance(chatId);
+    if (action === "open_imgmodel") {
+      const rows = Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text:`${s.imgModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_im_${k}` }]);
+      rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
+      return bot.sendMessage(chatId, "🎨 *Модель изображения:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+    }
+    if (action === "open_vidmodel") {
+      const rows = Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text:`${s.vidModel===k?"✅ ":""}${v.label} (${v.credits})`, callback_data:`set_vm_${k}` }]);
+      rows.push([{ text:"◀️ Назад", callback_data:"back_menu" }]);
+      return bot.sendMessage(chatId, "🎥 *Модель видео:*", { parse_mode:"Markdown", reply_markup: { inline_keyboard: rows } });
+    }
+    if (action === "do_image") {
+      s.step="waiting_prompt"; s.tab="image"; s.mode="normal";
+      return bot.sendMessage(chatId, `🖼️ *Изображение*\n${IMAGE_MODELS[s.imgModel].label}\n\nНапиши промпт:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+    }
+    if (action === "do_image_ref") {
+      s.pendingRefImages=[]; s.tab="image_ref"; s.mode="normal"; s.step="waiting_ref_photos";
+      return bot.sendMessage(chatId, "🖼️📸 *Изображение из референсов*\n\nОтправь до 10 фото по одному.\nКогда добавишь все — нажми кнопку:", { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
+        [{ text:"✅ Референсы готовы, ввести промпт", callback_data:"ref_photos_done" }],
+        [{ text:"❌ Отмена", callback_data:"back_menu" }],
+      ]}});
+    }
+    if (action === "do_vtext") {
+      s.step="waiting_prompt"; s.tab="video_text"; s.mode="normal";
+      return bot.sendMessage(chatId, `🎬 *Видео из текста*\n${VIDEO_MODELS[s.vidModel].label}\n\nОпиши видео:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] } });
+    }
+    if (action === "do_vimage") {
+      const maxVidRef = s.vidModel === "grok_vid" ? 7 : 3;
+      s.pendingRefImages=[]; s.tab="video_ref"; s.mode="normal"; s.step="waiting_vid_ref_photos";
+      return bot.sendMessage(chatId, `📸 *Видео из фото*\n${VIDEO_MODELS[s.vidModel].label}\n\nОтправь до ${maxVidRef} фото:`, { parse_mode:"Markdown", reply_markup: { inline_keyboard: [
+        [{ text:"✅ Фото готовы, ввести промпт", callback_data:"vid_ref_photos_done" }],
+        [{ text:"❌ Отмена", callback_data:"back_menu" }],
+      ]}});
+    }
+    return;
+  }
 
   if (s.step === "waiting_count") {
     const n = parseInt(msg.text);
