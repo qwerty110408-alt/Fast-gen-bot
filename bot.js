@@ -53,16 +53,14 @@ async function scheduleVideoChunk(chatId) {
   const { tasks, model, s } = job;
   const chunk = tasks.splice(0, 15); // берём до 15 задач
   const total = job.totalTasks;
-  const done_before = job.doneSoFar;
 
+  const { ratio: jobRatio, resolution: jobRes } = job.s;
   const statusText = () =>
-    `⏰ *Почасовой пакет (видео)*
-` +
-    `Всего задач: ${total} | Осталось: ${job.tasks.length + chunk.length}
-` +
-    `✓${job.doneSoFar} ✗${job.errorsSoFar}
-` +
-    `Текущий пачок: ${chunk.length} задач`;
+    `⏰ *Почасовой пакет (видео)*\n` +
+    `🤖 ${model.label} | 📐 ${jobRatio}\n` +
+    `Всего: ${total} | Осталось: ${job.tasks.length}\n` +
+    `✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
+    `⚙️ Текущая пачка: ${chunk.length} задач`;
 
   if (!job.statusMsgId) {
     const m = await bot.sendMessage(chatId, statusText(), { parse_mode: "Markdown" });
@@ -71,32 +69,39 @@ async function scheduleVideoChunk(chatId) {
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
   }
 
-  for (const task of chunk) {
+  // Запускаем все задачи чанка через очередь (макс 10 параллельно) и ЖДЁМ все
+  const chunkPromises = chunk.map(task =>
     videoQueue(async () => {
       try {
         await genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId);
         job.doneSoFar++;
-      } catch { job.errorsSoFar++; }
+      } catch {
+        job.errorsSoFar++;
+      }
       await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
-    });
-  }
-  // Ждём завершения всех в чанке
-  await new Promise(r => setTimeout(r, 5000)); // небольшая пауза чтобы запустились
+    })
+  );
+
+  // Ждём пока ВСЕ задачи чанка завершатся
+  await Promise.allSettled(chunkPromises);
 
   if (job.tasks.length > 0) {
-    // Сколько ждать до следующего часа
-    const msLeft = Math.max(0, balanceState.resetAt - Date.now());
-    const waitMs = msLeft + 2000; // +2 сек буфер после сброса
-    const resetTime = new Date(balanceState.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
-    await bot.sendMessage(chatId, `⏳ Осталось *${job.tasks.length}* видео-задач.
-Запущу следующий пачок в *${resetTime}* (после сброса лимита).
-Можно закрыть бот — он сам продолжит.`, { parse_mode: "Markdown" });
+    // Сколько ждать до следующего сброса лимита
+    const msLeft = Math.max(60000, balanceState.resetAt - Date.now()); // минимум 1 мин чтобы не зациклиться
+    const waitMs = msLeft + 3000; // +3 сек буфер
+    const resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+    await bot.sendMessage(chatId,
+      `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
+      `Осталось *${job.tasks.length}* задач.\n` +
+      `🕐 Следующая пачка запустится в *${resetTime}* (сброс лимита).\n` +
+      `Можно закрыть приложение — бот сам продолжит.`,
+      { parse_mode: "Markdown" });
     setTimeout(() => scheduleVideoChunk(chatId), waitMs);
   } else {
-    await bot.editMessageText(`✅ *Почасовой пакет завершён!*
-✓${job.doneSoFar} ✗${job.errorsSoFar}`, {
-      chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown"
-    }).catch(()=>{});
+    await bot.editMessageText(
+      `✅ *Почасовой пакет завершён!*\n✓${job.doneSoFar} ✗${job.errorsSoFar}`,
+      { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }
+    ).catch(()=>{});
     delete videoScheduler[chatId];
     showMainMenu(chatId);
   }
@@ -203,7 +208,9 @@ const DEFAULT_STATE = () => ({
   seed: "random", resolution: "720p", mode: "normal",
   batchPrompts: [], batchPhotos: [],
   batchPromptIdx: 0,
-  batchType: "image", // "image" | "video_text" | "video_image"
+  batchType: "image",
+  batchImgModel: null, batchVidModel: null,
+  batchRatio: null, batchResolution: null,
   keyframeStart: null, keyframeEnd: null,
   fileId: null,
   pendingRefImages: [],
@@ -242,6 +249,8 @@ function saveState(chatId) {
     tab: s.tab, imgModel: s.imgModel, vidModel: s.vidModel,
     ratio: s.ratio, count: s.count, perPrompt: s.perPrompt,
     seed: s.seed, resolution: s.resolution, batchType: s.batchType,
+    batchImgModel: s.batchImgModel, batchVidModel: s.batchVidModel,
+    batchRatio: s.batchRatio, batchResolution: s.batchResolution,
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
   };
@@ -287,7 +296,7 @@ async function sendMedia(chatId, media, isImage, caption, replyMarkup = null) {
 }
 
 // ─── Поллинг ──────────────────────────────
-async function pollResult(opId, max=36, interval=10000) {
+async function pollResult(opId, max=90, interval=10000) {
   for (let i=0; i<max; i++) {
     await new Promise(r => setTimeout(r, interval));
     try {
@@ -378,6 +387,73 @@ async function showMainMenu(chatId) {
   }
   const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
   s.menuMsgId = m.message_id;
+}
+
+
+// ─── Хелперы для пакетных настроек ───────
+// Возвращает эффективные настройки пакета (собственные или из главного меню)
+function batchEffective(s) {
+  const bt = s.batchType || "image";
+  const isImage = bt === "image";
+  const imgModelKey = s.batchImgModel || s.imgModel;
+  const vidModelKey = s.batchVidModel || s.vidModel;
+  const model = isImage ? IMAGE_MODELS[imgModelKey] : VIDEO_MODELS[vidModelKey];
+  const ratio = s.batchRatio || s.ratio;
+  const resolution = s.batchResolution || s.resolution || "720p";
+  return { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution };
+}
+
+// Меню настроек пакета (модель, соотношение, разрешение)
+function showBatchSettingsMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution } = batchEffective(s);
+  const isGrok = vidModelKey === "grok_vid";
+
+  const ownImgModel = s.batchImgModel != null;
+  const ownVidModel = s.batchVidModel != null;
+  const ownRatio    = s.batchRatio != null;
+  const ownRes      = s.batchResolution != null;
+
+  const text =
+    `⚙️ *Настройки пакета*\n\n` +
+    `${isImage ? "🖼" : "🎬"} Модель: *${model.label}*${!isImage && !ownVidModel || isImage && !ownImgModel ? " _(из главного меню)_" : " _(своя)_"}\n` +
+    `📐 Соотношение: *${ratio}*${!ownRatio ? " _(из главного меню)_" : " _(своё)_"}\n` +
+    (!isImage && isGrok ? `🖥 Разрешение: *${resolution}*${!ownRes ? " _(из главного меню)_" : " _(своё)_"}\n` : "") +
+    `\nИзменения применяются только к пакетному режиму.`;
+
+  const modelRows = isImage
+    ? Object.entries(IMAGE_MODELS).map(([k,v]) => [{
+        text: `${imgModelKey===k?"✅ ":""}${v.label}`,
+        callback_data: `bset_im_${k}`
+      }])
+    : Object.entries(VIDEO_MODELS).map(([k,v]) => [{
+        text: `${vidModelKey===k?"✅ ":""}${v.label}`,
+        callback_data: `bset_vm_${k}`
+      }]);
+
+  const ratioRows = [RATIOS.map(r => ({
+    text: `${ratio===r?"✅ ":""}${r}`,
+    callback_data: `bset_ratio_${r.replace(":","x")}`
+  }))];
+
+  const resRow = (!isImage && isGrok) ? [
+    ["720p","1080p"].map(r => ({ text: `${resolution===r?"✅ ":""}${r}`, callback_data: `bset_res_${r}` }))
+  ] : [];
+
+  const resetRow = [
+    { text: "🔄 Сбросить (= главное меню)", callback_data: "bset_reset" }
+  ];
+
+  const kb = { inline_keyboard: [
+    ...modelRows,
+    ...ratioRows,
+    ...resRow,
+    [resetRow[0]],
+    [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
+  ]};
+
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 // ─── Выбор типа пакетного режима ─────────
@@ -812,6 +888,29 @@ bot.on("callback_query", async (query) => {
   if (data === "batch_clear") { s.batchPrompts=[]; s.batchPhotos=[]; s.batchPromptIdx=0; return showBatchMenu(chatId, msgId); }
   if (data === "batch_run") { del(); return runBatch(chatId); }
 
+  // ── Настройки пакета
+  if (data === "batch_settings") { return showBatchSettingsMenu(chatId, msgId); }
+  if (data.startsWith("bset_im_")) {
+    s.batchImgModel = data.replace("bset_im_","");
+    saveState(chatId); return showBatchSettingsMenu(chatId, msgId);
+  }
+  if (data.startsWith("bset_vm_")) {
+    s.batchVidModel = data.replace("bset_vm_","");
+    saveState(chatId); return showBatchSettingsMenu(chatId, msgId);
+  }
+  if (data.startsWith("bset_ratio_")) {
+    s.batchRatio = data.replace("bset_ratio_","").replace("x",":");
+    saveState(chatId); return showBatchSettingsMenu(chatId, msgId);
+  }
+  if (data.startsWith("bset_res_")) {
+    s.batchResolution = data.replace("bset_res_","");
+    saveState(chatId); return showBatchSettingsMenu(chatId, msgId);
+  }
+  if (data === "bset_reset") {
+    s.batchImgModel=null; s.batchVidModel=null; s.batchRatio=null; s.batchResolution=null;
+    saveState(chatId); return showBatchSettingsMenu(chatId, msgId);
+  }
+
   if (data === "bp_prev") { s.batchPromptIdx = Math.max(0, (s.batchPromptIdx||0)-1); return showBatchMenu(chatId, msgId); }
   if (data === "bp_next") { s.batchPromptIdx = Math.min(s.batchPrompts.length-1, (s.batchPromptIdx||0)+1); return showBatchMenu(chatId, msgId); }
   if (data === "bp_delete") {
@@ -1203,10 +1302,11 @@ async function runKeyframes(chatId, s, prompt) {
 // ─── Пакетная генерация ───────────────────
 async function runBatch(chatId) {
   const s = getState(chatId);
-  const bt = s.batchType || "image";
-  const isImage = bt === "image";
+  // Берём эффективные настройки пакета (свои или из главного меню)
+  const { bt, isImage, model, ratio, resolution } = batchEffective(s);
   const isVideoImage = bt === "video_image";
-  const model = isImage ? IMAGE_MODELS[s.imgModel] : VIDEO_MODELS[s.vidModel];
+  // Создаём временную копию состояния с настройками пакета для genOne
+  const batchS = { ...s, ratio, resolution };
   const prompts = [...s.batchPrompts];
   const photos = [...s.batchPhotos];
   const perPrompt = s.perPrompt || 1;
@@ -1244,7 +1344,7 @@ async function runBatch(chatId) {
       doneSoFar: 0,
       errorsSoFar: 0,
       statusMsgId: null,
-      model, s,
+      model, s: batchS,
     };
     await bot.sendMessage(chatId,
       `⏰ *Почасовой видео-пакет запущен!*\n` +
@@ -1263,11 +1363,11 @@ async function runBatch(chatId) {
   let done = 0, errors = 0;
   const typeLabel = isImage ? "🖼 Фото" : isVideoImage ? "📸 Видео из фото" : "🎬 Видео";
   const statusMsg = await bot.sendMessage(chatId,
-    `📦 *Пакетный режим*\n${typeLabel} | Задач: ${total} | ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
+    `📦 *Пакетный режим*\n${typeLabel} | Задач: ${total}\n🤖 ${model.label} | 📐 ${ratio}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
     { parse_mode: "Markdown" });
 
   const allTasks = tasks.map(task =>
-    queue(() => genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId))
+    queue(() => genOne(chatId, batchS, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId))
       .then(() => done++)
       .catch(() => errors++)
       .finally(() => {
