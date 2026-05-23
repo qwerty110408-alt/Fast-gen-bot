@@ -5,6 +5,7 @@ const fs = require("fs");
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
 const BASE_URL = "https://googler.fast-gen.ai";
+const STORAGE_URL = "https://storage.fast-gen.ai";
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // ─── Персистентное состояние ──────────────
@@ -39,6 +40,120 @@ function createQueue(concurrency) {
 
 const imageQueue = createQueue(10); // 10 параллельных для фото
 const videoQueue = createQueue(10); // 10 параллельных для видео
+
+// ─── Storage Server — загрузка файла ─────
+async function uploadToStorage(buffer, filename = "image.jpg") {
+  try {
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("file", buffer, { filename, contentType: "image/jpeg" });
+    const { data } = await axios.post(`${STORAGE_URL}/upload`, form, {
+      headers: { ...form.getHeaders(), "X-API-Key": FASTGEN_API_KEY },
+      timeout: 30000,
+    });
+    return data.file_hash ? `file:${data.file_hash}` : null;
+  } catch(e) {
+    console.log("[storage] upload failed:", e.message);
+    return null;
+  }
+}
+
+// ─── Получить реальный баланс с API ──────
+async function fetchRealUsage() {
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000,
+    });
+    return data;
+  } catch(e) {
+    console.log("[usage] fetch failed:", e.message);
+    return null;
+  }
+}
+
+// ─── Отмена всех операций ────────────────
+async function cancelAllOperations() {
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/v4/operations/cancel-all`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000,
+    });
+    return data;
+  } catch(e) {
+    console.log("[cancel-all] failed:", e.message);
+    return null;
+  }
+}
+
+// ─── Отмена конкретной операции ──────────
+async function cancelOperation(opId) {
+  try {
+    const { data } = await axios.post(`${BASE_URL}/api/v4/operations/cancel`, {
+      operation_ids: [opId],
+    }, {
+      headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
+      timeout: 10000,
+    });
+    return data;
+  } catch(e) {
+    console.log("[cancel] failed:", e.message);
+    return null;
+  }
+}
+
+// ─── Улучшение промпта через FastGen LLM ─
+// Умный системный промпт — адаптируется под тип контента
+function buildEnhanceSystemPrompt(isVideo) {
+  const mediaType = isVideo ? "video generation" : "image generation";
+  return `You are an expert prompt engineer for AI ${mediaType} models (like Imagen, Veo, Grok, DALL-E).
+
+Your task: take the user's raw prompt and rewrite it into a highly detailed, optimized prompt for ${mediaType}.
+
+Rules:
+- Detect the content type automatically: portrait, landscape, abstract, anime, realistic, cinematic, product, fantasy, sci-fi, etc.
+- For portraits: add lighting details (soft rim light, golden hour), camera angle, skin details, expression, background blur
+- For landscapes/nature: add atmosphere, time of day, weather, depth, color palette
+- For cinematic/action: add camera movement${isVideo ? " (slow zoom, pan, dolly)" : ""}, color grade, film style
+- For abstract/artistic: add style references, texture, mood, color theory
+- For anime/illustration: add art style (Studio Ghibli, manga, etc.), line quality, color vibrancy
+${isVideo ? "- For video: add motion description, camera movement, transition style, pacing" : ""}
+- Always add: quality boosters (photorealistic, 8K, sharp focus, professional photography, award-winning)
+- Keep the core idea intact — only expand and improve, never change the subject
+- Output ONLY the improved prompt, nothing else, no explanations, no preamble`;
+}
+
+async function enhancePrompt(rawPrompt, isVideo = false) {
+  const systemPrompt = buildEnhanceSystemPrompt(isVideo);
+  try {
+    const { data } = await axios.post(`${BASE_URL}/api/v5/prompts/generate`, {
+      prompt: `${systemPrompt}\n\nUser prompt to improve: ${rawPrompt}`,
+    }, {
+      headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
+      timeout: 30000,
+    });
+    // v5 может вернуть сразу текст или operation_id
+    if (data.text) return data.text.trim();
+    if (data.result?.text) return data.result.text.trim();
+    // Если вернул operation_id — поллим
+    const opId = data.operation_id || data.task_id || data.id;
+    if (opId) {
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const { data: op } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
+          headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000,
+        });
+        const st = op.status || op.state;
+        if (["completed","success","done","finished"].includes(st)) {
+          return (op.result?.text || op.text || String(op.result || "")).trim();
+        }
+        if (["failed","error","cancelled"].includes(st)) throw new Error("LLM failed");
+      }
+    }
+    return null;
+  } catch(e) {
+    console.log("[enhance] failed:", e.message);
+    return null;
+  }
+}
 
 // ─── Почасовой планировщик видео ─────────
 // chatId -> { tasks, statusMsgId, model, s }
@@ -141,19 +256,17 @@ function spendBalance(type, amount = 1) {
   saveJSON(BALANCE_FILE, balanceState);
 }
 
-function formatBalance() {
+async function formatBalance() {
   checkResetBalance();
   const b = balanceState;
   const imgLeft = Math.max(0, HOURLY_LIMITS.images - b.images);
   const vidLeft = Math.max(0, HOURLY_LIMITS.videos - b.videos);
   const tokLeft = Math.max(0, HOURLY_LIMITS.tokens - b.tokens);
 
-  // Время до сброса
   const msLeft = Math.max(0, b.resetAt - Date.now());
   const totalMin = Math.ceil(msLeft / 60000);
   const h = Math.floor(totalMin / 60), m = totalMin % 60;
   const resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
-  // Время сброса
   const resetTime = new Date(b.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
 
   function fmtTok(n) {
@@ -162,17 +275,36 @@ function formatBalance() {
     return String(n);
   }
 
+  // Пробуем получить реальные данные с API
+  let realBlock = "";
+  try {
+    const usage = await fetchRealUsage();
+    if (usage) {
+      const lim = usage.account_limits || {};
+      const cur = usage.current_usage || {};
+      const threads = cur.active_threads || {};
+      const hourly = cur.hourly_usage || {};
+      realBlock =
+        `\n📡 *Реальный баланс API:*\n` +
+        `🖼 Лимит фото/час: *${lim.img_gen_per_hour_limit || "?"}*\n` +
+        `🎬 Лимит видео/час: *${lim.video_gen_per_hour_limit || "?"}*\n` +
+        `💬 Токенов/час: *${fmtTok(lim.prompt_tokens_per_hour_limit || 0)}*\n` +
+        `⚡ Активных потоков: фото=${threads.image_threads || 0}, видео=${threads.video_threads || 0}\n`;
+    }
+  } catch(e) {}
+
   return (
     `📊 *Баланс и лимиты* (общий)\n\n` +
     `🖼 Изображения: *${imgLeft}/${HOURLY_LIMITS.images}*\n` +
     `🎬 Видео: *${vidLeft}/${HOURLY_LIMITS.videos}*\n` +
     `💬 Токены промптов: *${fmtTok(tokLeft)}/${fmtTok(HOURLY_LIMITS.tokens)}*\n` +
-    `⏱ Сброс через: *${resetStr}* (в ${resetTime})\n\n` +
-    `Стоимость моделей:\n` +
+    `⏱ Сброс через: *${resetStr}* (в ${resetTime})\n` +
+    realBlock +
+    `\nСтоимость моделей:\n` +
     `🖼 Imagen/NanoPro/NanoBanana Flow: 4 кред\n` +
     `🖼 Grok быстро: 1 кред = 6 фото\n` +
     `🖼 Grok качество: 1 кред = 4 фото\n` +
-    `🖼 NanoBanana Flower / ChatGPT: 1 кред\n` +
+    `🖼 NanaBanana Flower / ChatGPT / Remix: 1 кред\n` +
     `🎬 Veo 3.1 Fast/Light/Flower/Grok: 1 кред\n` +
     `🎬 Veo 3.1 Quality: 10 кред\n\n` +
     `Обновлено: ${new Date().toLocaleTimeString("ru")}`
@@ -188,6 +320,7 @@ const IMAGE_MODELS = {
   "grok_quality":  { label: "Grok (качество)",        ep: "/api/v4/grok/image/generate",   credits: "1 кред = 4 фото",   cost: 1, quality: "quality" },
   "nanob2_flower": { label: "Nano Banana 2 - Flower", ep: "/api/v4/flower/image/generate", credits: "1 кред = 1 фото",   cost: 1 },
   "chatgpt":       { label: "ChatGPT Images 2.0",     ep: "/api/v4/openai/image/generate", credits: "1 кред = 1 фото",   cost: 1 },
+  "remix":         { label: "🎨 Remix (GoogleFX)",     ep: "/api/v4/flow/image/remix",      credits: "1 кред = 1 фото",   cost: 1, isRemix: true },
 };
 
 const VIDEO_MODELS = {
@@ -221,6 +354,11 @@ const DEFAULT_STATE = () => ({
   pgProvider: "fastgen",
   pgApiKey: null,
   pgTemplate: `I'll send you a paragraph from a story, and you'll generate a detailed image prompt for image generation.\nKeep total response length under 1000 symbols.\n\n**Follow these steps:**\n1. Prompt: Create a vivid 1-line prompt, specifying:\n- Visual focus (characters, objects, scenery).\n- Atmosphere (e.g., "gloomy," "whimsical").\n- Style (e.g., "photorealistic," "oil painting").\n- Lighting (e.g., "soft morning light").\n- Color palette.\n- Camera angle (e.g., "wide shot," "close-up").\n2. Negative: list what to avoid.\n\nText: {TEXT}`,
+  // Улучшение промпта
+  enhanceMode: "ask", // "always" | "never" | "ask"
+  // Remix
+  remixImages: [], // [{fileId, category}]
+  remixStep: null,
 });
 
 const userState = {};
@@ -253,6 +391,7 @@ function saveState(chatId) {
     batchRatio: s.batchRatio, batchResolution: s.batchResolution,
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
+    enhanceMode: s.enhanceMode,
   };
   saveJSON(STATE_FILE, persistedStates);
 }
@@ -323,9 +462,10 @@ async function pollResult(opId, max=90, interval=10000) {
 // ─── Баланс UI ────────────────────────────
 async function showBalance(chatId, msgId = null) {
   const s = getState(chatId);
-  const text = formatBalance();
+  const text = await formatBalance();
   const kb = { inline_keyboard: [
     [{ text: "🔄 Обновить", callback_data: "refresh_balance" }],
+    [{ text: "🔴 Отменить все задачи", callback_data: "cancel_all_ops" }],
     [{ text: "◀️ Назад", callback_data: "close_balance" }],
   ]};
   const targetId = msgId || s.menuMsgId;
@@ -362,20 +502,23 @@ async function showMainMenu(chatId) {
   const s = getState(chatId);
   const im = IMAGE_MODELS[s.imgModel];
   const vm = VIDEO_MODELS[s.vidModel];
+  const enhanceLabel = { always: "✨ Всегда", never: "⏭ Никогда", ask: "❓ Спрашивать" }[s.enhanceMode || "ask"];
   const text =
     `🤖 *FastGen Bot*\n\n` +
     `🖼 Фото: *${im.label}*\n└ ${im.credits}\n` +
     `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
-    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}`;
+    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}\n` +
+    `✨ Улучшение промпта: *${enhanceLabel}*`;
   const kb = { inline_keyboard: [
     [{ text: "🖼️ Изображение", callback_data: "do_image" }, { text: "🖼️📸 Фото из рефов", callback_data: "do_image_ref" }],
     [{ text: "🎬 Видео из текста", callback_data: "do_vtext" }, { text: "📸 Видео из фото", callback_data: "do_vimage" }],
-    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
+    [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }, { text: "🎨 Remix", callback_data: "do_remix" }],
     [{ text: "📦 Пакетный режим", callback_data: "do_batch" }],
     [{ text: "🎨 Модель фото", callback_data: "open_imgmodel" }, { text: "🎥 Модель видео", callback_data: "open_vidmodel" }],
     [{ text: "📐 Соотношение", callback_data: "open_ratio" }, { text: "🔢 Количество", callback_data: "open_count" }],
     [{ text: "🌱 Seed", callback_data: "open_seed" }, { text: "📊 Баланс", callback_data: "show_balance" }],
     ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+    [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
     [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
     [{ text: "📋 История", callback_data: "show_history" }],
   ]};
@@ -553,6 +696,58 @@ function showBatchPhotosMenu(chatId, msgId) {
   const rows = photos.map((_, i) => [{ text: `🗑 Удалить фото ${i+1}`, callback_data: `del_photo_${i}` }]);
   rows.push([{ text: "◀️ Назад", callback_data: "do_batch_menu" }]);
   bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } }).catch(()=>{});
+}
+
+// ─── Remix меню ───────────────────────────
+function showRemixMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const imgs = s.remixImages || [];
+  const categoryEmoji = { MEDIA_CATEGORY_SUBJECT: "👤", MEDIA_CATEGORY_SCENE: "🌄", MEDIA_CATEGORY_STYLE: "🎨" };
+  const catList = imgs.map((img, i) =>
+    `${i+1}. ${categoryEmoji[img.category] || "📷"} ${img.category.replace("MEDIA_CATEGORY_","")}`
+  ).join("\n") || "_Нет фото_";
+
+  const text =
+    `🎨 *Remix Image*\n\n` +
+    `Добавь 1-3 фото и укажи роль каждого:\n` +
+    `👤 SUBJECT — кто/что (персонаж, объект)\n` +
+    `🌄 SCENE — фон, место, обстановка\n` +
+    `🎨 STYLE — арт-стиль, атмосфера\n\n` +
+    `*Добавлено:* ${imgs.length}/3\n${catList}`;
+
+  const addRows = imgs.length < 3 ? [
+    [{ text: "➕ Добавить фото", callback_data: "remix_add_photo" }],
+  ] : [];
+  const deleteRows = imgs.map((_, i) => [{ text: `🗑 Удалить фото ${i+1}`, callback_data: `remix_del_${i}` }]);
+  const goRow = imgs.length >= 1 ? [{ text: "✏️ Ввести промпт →", callback_data: "remix_go" }] : [];
+
+  const kb = { inline_keyboard: [
+    ...addRows,
+    ...deleteRows,
+    ...(goRow.length ? [goRow] : []),
+    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+// ─── Меню настройки улучшения промпта ────
+function showEnhanceMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const mode = s.enhanceMode || "ask";
+  const text =
+    `✨ *Улучшение промпта*\n\n` +
+    `FastGen LLM автоматически улучшает твой промпт перед генерацией — добавляет детали освещения, стиля, камеры, атмосферы.\n\n` +
+    `*Режим:*`;
+  const kb = { inline_keyboard: [
+    [{ text: mode==="always" ? "✅ Всегда улучшать" : "Всегда улучшать", callback_data: "enhance_always" }],
+    [{ text: mode==="ask"    ? "✅ Спрашивать каждый раз" : "Спрашивать каждый раз", callback_data: "enhance_ask" }],
+    [{ text: mode==="never"  ? "✅ Никогда (оригинальный)" : "Никогда (оригинальный)", callback_data: "enhance_never" }],
+    [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(()=>{});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 // ─── Перегенерация ────────────────────────
@@ -1010,6 +1205,87 @@ bot.on("callback_query", async (query) => {
     ]});
   }
   if (data.startsWith("set_res_")) { s.resolution=data.replace("set_res_",""); saveState(chatId); del(); return showMainMenu(chatId); }
+
+  // ── Улучшение промпта — настройки
+  if (data === "open_enhance") { return showEnhanceMenu(chatId, msgId); }
+  if (data === "enhance_always") { s.enhanceMode="always"; saveState(chatId); return showEnhanceMenu(chatId, msgId); }
+  if (data === "enhance_ask")    { s.enhanceMode="ask";    saveState(chatId); return showEnhanceMenu(chatId, msgId); }
+  if (data === "enhance_never")  { s.enhanceMode="never";  saveState(chatId); return showEnhanceMenu(chatId, msgId); }
+
+  // ── Улучшение промпта — ответ пользователя (yes/no)
+  if (data === "enhance_yes") {
+    const rawPrompt = s.pendingPrompt;
+    const isVideo = s.pendingIsVideo;
+    const genKey = s.pendingGenKey;
+    const genFn = pendingGenerators.get(genKey);
+    if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
+    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null;
+    if (!genFn || !rawPrompt) return showMainMenu(chatId);
+    const waitMsg = await bot.sendMessage(chatId, "✨ Улучшаю промпт...");
+    const enhanced = await enhancePrompt(rawPrompt, isVideo);
+    await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
+    if (enhanced && enhanced !== rawPrompt) {
+      await bot.sendMessage(chatId,
+        `✨ *Промпт улучшен:*\n_${enhanced.slice(0,300)}${enhanced.length>300?"...":""}_`,
+        { parse_mode: "Markdown" }
+      );
+      pendingGenerators.delete(genKey);
+      return genFn(enhanced);
+    }
+    pendingGenerators.delete(genKey);
+    return genFn(rawPrompt);
+  }
+  if (data === "enhance_no") {
+    const rawPrompt = s.pendingPrompt;
+    const genKey = s.pendingGenKey;
+    const genFn = pendingGenerators.get(genKey);
+    if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
+    s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null;
+    if (!genFn || !rawPrompt) return showMainMenu(chatId);
+    pendingGenerators.delete(genKey);
+    return genFn(rawPrompt);
+  }
+
+  // ── Отмена всех операций
+  if (data === "cancel_all_ops") {
+    await bot.answerCallbackQuery(query.id, { text: "⏳ Отменяю..." });
+    const result = await cancelAllOperations();
+    const txt = result
+      ? `✅ Все операции отменены!\n${JSON.stringify(result).slice(0,100)}`
+      : "❌ Не удалось отменить операции";
+    await bot.sendMessage(chatId, txt);
+    return showBalance(chatId, msgId);
+  }
+
+  // ── Remix
+  if (data === "do_remix") {
+    s.remixImages = []; s.tab = "image"; s.mode = "normal";
+    return showRemixMenu(chatId, msgId);
+  }
+  if (data === "remix_add_photo") {
+    s.step = "waiting_remix_photo";
+    return edit("📸 Отправь фото для Remix:", { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"do_remix" }]] });
+  }
+  if (data === "remix_go") {
+    s.step = "waiting_remix_prompt";
+    return edit("✏️ Напиши промпт для Remix:", { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"do_remix" }]] });
+  }
+  if (data.startsWith("remix_del_")) {
+    const ri = parseInt(data.replace("remix_del_",""));
+    if (s.remixImages) s.remixImages.splice(ri, 1);
+    return showRemixMenu(chatId, msgId);
+  }
+  if (data.startsWith("remix_cat_")) {
+    // remix_cat_0_MEDIA_CATEGORY_SUBJECT
+    const parts = data.split("_");
+    const photoIdx = parseInt(parts[2]);
+    const category = parts.slice(3).join("_");
+    if (!s.remixImages) s.remixImages = [];
+    // Этот fileId уже сохранён в s.pendingRemixFileId
+    s.remixImages.push({ fileId: s.pendingRemixFileId, category });
+    s.pendingRemixFileId = null;
+    return showRemixMenu(chatId, msgId);
+  }
 });
 
 // ─── Фото ─────────────────────────────────
@@ -1042,6 +1318,18 @@ bot.on("photo", async (msg) => {
     return bot.sendMessage(chatId, "✅ Оба кадра! Напиши описание:", {
       reply_markup: { inline_keyboard: [[{ text:"❌ Отмена", callback_data:"back_menu" }]] }
     });
+  }
+  if (s.step === "waiting_remix_photo") {
+    s.pendingRemixFileId = fileId;
+    s.step = null;
+    const idx = (s.remixImages || []).length;
+    const kb = { inline_keyboard: [
+      [{ text: "👤 Субъект (кто/что)", callback_data: `remix_cat_${idx}_MEDIA_CATEGORY_SUBJECT` }],
+      [{ text: "🌄 Сцена (фон/место)", callback_data: `remix_cat_${idx}_MEDIA_CATEGORY_SCENE` }],
+      [{ text: "🎨 Стиль", callback_data: `remix_cat_${idx}_MEDIA_CATEGORY_STYLE` }],
+      [{ text: "❌ Отмена", callback_data: "do_remix" }],
+    ]};
+    return bot.sendMessage(chatId, "🎨 Выбери роль этого фото:", { reply_markup: kb });
   }
   if (s.step === "waiting_ref_photos") {
     if (!s.pendingRefImages) s.pendingRefImages = [];
@@ -1232,6 +1520,12 @@ bot.on("message", async (msg) => {
     return runRegenItem(chatId, newItem, newItem.endpoint, newItem.isImage);
   }
 
+  if (s.step === "waiting_remix_prompt") {
+    s.step = null;
+    const prompt = msg.text;
+    return handlePromptAndGenerate(chatId, s, prompt, (finalPrompt) => runRemix(chatId, s, finalPrompt));
+  }
+
   if (s.step !== "waiting_prompt") return showMainMenu(chatId);
 
   const prompt = msg.text;
@@ -1241,6 +1535,48 @@ bot.on("message", async (msg) => {
 });
 
 // ─── Обычная генерация ────────────────────
+// Обработчик промпта с улучшением
+async function handlePromptAndGenerate(chatId, s, rawPrompt, generatorFn) {
+  const mode = s.enhanceMode || "ask";
+  const isVideo = s.tab === "video_text" || s.tab === "video_ref";
+
+  if (mode === "never") {
+    return generatorFn(rawPrompt);
+  }
+  if (mode === "always") {
+    const waitMsg = await bot.sendMessage(chatId, "✨ Улучшаю промпт...", {});
+    const enhanced = await enhancePrompt(rawPrompt, isVideo);
+    await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
+    if (enhanced && enhanced !== rawPrompt) {
+      await bot.sendMessage(chatId,
+        `✨ *Промпт улучшен:*\n_${enhanced.slice(0, 300)}${enhanced.length > 300 ? "..." : ""}_`,
+        { parse_mode: "Markdown" }
+      );
+      return generatorFn(enhanced);
+    }
+    return generatorFn(rawPrompt);
+  }
+  // mode === "ask"
+  const previewMsg = await bot.sendMessage(chatId,
+    `✨ *Улучшить промпт?*\n\n📝 _${rawPrompt.slice(0, 200)}${rawPrompt.length > 200 ? "..." : ""}_`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [
+        [{ text: "✨ Улучшить", callback_data: "enhance_yes" }, { text: "⏭ Оригинал", callback_data: "enhance_no" }],
+      ]}
+    }
+  );
+  // Сохраняем промпт и коллбэк в состояние
+  s.pendingPrompt = rawPrompt;
+  s.pendingIsVideo = isVideo;
+  s.pendingMsgId = previewMsg.message_id;
+  s.pendingGenKey = `gen_${Date.now()}`;
+  // Сохраняем функцию-генератор в Map
+  pendingGenerators.set(s.pendingGenKey, generatorFn);
+}
+
+// Map для хранения pending генераторов (не сериализуется)
+const pendingGenerators = new Map();
 async function runNormal(chatId, s, prompt) {
   const isImage = s.tab === "image" || s.tab === "image_ref";
   let model, endpoint;
@@ -1249,59 +1585,111 @@ async function runNormal(chatId, s, prompt) {
   else if (s.tab === "video_ref") { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
   else { model = VIDEO_MODELS[s.vidModel]; endpoint = model.epI; }
 
-  const count = s.count;
-  const queue = isImage ? imageQueue : videoQueue;
-  let done = 0, errors = 0;
-  const statusMsg = await bot.sendMessage(chatId,
-    `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
-    { parse_mode: "Markdown" });
+  const doGenerate = async (finalPrompt) => {
+    const count = s.count;
+    const queue = isImage ? imageQueue : videoQueue;
+    let done = 0, errors = 0;
+    const statusMsg = await bot.sendMessage(chatId,
+      `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
+      { parse_mode: "Markdown" });
 
-  const tasks = Array.from({length:count}, (_,i) =>
-    queue(() => genOne(chatId, s, prompt, endpoint, model, isImage, i+1, count))
-      .then(() => { done++; })
-      .catch(() => { errors++; })
-      .finally(() => {
-        bot.editMessageText(
-          `⏳ Прогресс: ✓${done}/${count}${errors>0?` ✗${errors}`:""}\n🎨 ${model.label}`,
-          { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
-        ).catch(()=>{});
-      })
-  );
+    const tasks = Array.from({length:count}, (_,i) =>
+      queue(() => genOne(chatId, s, finalPrompt, endpoint, model, isImage, i+1, count))
+        .then(() => { done++; })
+        .catch(() => { errors++; })
+        .finally(() => {
+          bot.editMessageText(
+            `⏳ Прогресс: ✓${done}/${count}${errors>0?` ✗${errors}`:""}\n🎨 ${model.label}`,
+            { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+          ).catch(()=>{});
+        })
+    );
 
-  await Promise.allSettled(tasks);
-  await bot.editMessageText(`✅ Готово! ✓${done}${errors>0?` ✗${errors}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
-  showMainMenu(chatId);
+    await Promise.allSettled(tasks);
+    await bot.editMessageText(`✅ Готово! ✓${done}${errors>0?` ✗${errors}`:""}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
+    showMainMenu(chatId);
+  };
+
+  await handlePromptAndGenerate(chatId, s, prompt, doGenerate);
 }
 
 // ─── Ключевые кадры ───────────────────────
 async function runKeyframes(chatId, s, prompt) {
-  const model = VIDEO_MODELS[s.vidModel];
-  const statusMsg = await bot.sendMessage(chatId, `⏳ Ключевые кадры...\n🎥 ${model.label}`);
+  const doGenerate = async (finalPrompt) => {
+    const model = VIDEO_MODELS[s.vidModel];
+    const statusMsg = await bot.sendMessage(chatId, `⏳ Ключевые кадры...\n🎥 ${model.label}`);
+    try {
+      const body = { prompt: finalPrompt, aspect_ratio: s.ratio, ...(model.sub && { model: model.sub }) };
+      if (s.keyframeStart) {
+        const f = await bot.getFile(s.keyframeStart);
+        const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
+        body.start_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
+      }
+      if (s.keyframeEnd) {
+        const f = await bot.getFile(s.keyframeEnd);
+        const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
+        body.end_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
+      }
+      const { data } = await axios.post(`${BASE_URL}${model.epK || model.epT}`, body, {
+        headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" }, timeout: 60000
+      });
+      const opId = data.operation_id || data.task_id || data.id;
+      if (!opId) throw new Error("Нет ID");
+      const result = await pollResult(opId);
+      if (result) {
+        await bot.editMessageText("✅ Готово!", { chat_id: chatId, message_id: statusMsg.message_id });
+        await sendMedia(chatId, result, false, `🎞 Ключ. кадры\n📝 _${finalPrompt.slice(0,100)}_`);
+      }
+    } catch(e) {
+      await bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+    }
+    showMainMenu(chatId);
+  };
+  await handlePromptAndGenerate(chatId, s, prompt, doGenerate);
+}
+
+// ─── Remix генерация ──────────────────────
+async function runRemix(chatId, s, prompt) {
+  const imgs = s.remixImages || [];
+  if (imgs.length === 0) return bot.sendMessage(chatId, "❌ Добавь хотя бы одно фото для Remix!");
+  const statusMsg = await bot.sendMessage(chatId, `⏳ *Remix генерация...*\n📸 Фото: ${imgs.length}`, { parse_mode: "Markdown" });
   try {
-    const body = { prompt, aspect_ratio: s.ratio, ...(model.sub && { model: model.sub }) };
-    if (s.keyframeStart) {
-      const f = await bot.getFile(s.keyframeStart);
-      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
-      body.start_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
+    const referenceImages = [];
+    for (const img of imgs) {
+      const f = await bot.getFile(img.fileId);
+      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+      const buf = Buffer.from(r.data);
+      const fileRef = await uploadToStorage(buf);
+      referenceImages.push({
+        image: fileRef || `data:image/jpeg;base64,${buf.toString("base64")}`,
+        category: img.category,
+      });
     }
-    if (s.keyframeEnd) {
-      const f = await bot.getFile(s.keyframeEnd);
-      const r = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType:"arraybuffer" });
-      body.end_image = `data:image/jpeg;base64,${Buffer.from(r.data).toString("base64")}`;
-    }
-    const { data } = await axios.post(`${BASE_URL}${model.epK || model.epT}`, body, {
-      headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" }, timeout: 60000
+    const body = {
+      prompt,
+      reference_images: referenceImages,
+      aspect_ratio: s.ratio,
+      ...(s.seed === "fixed" && { seed: 42 }),
+    };
+    const { data } = await axios.post(`${BASE_URL}/api/v4/flow/image/remix`, body, {
+      headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
+      timeout: 120000,
     });
     const opId = data.operation_id || data.task_id || data.id;
-    if (!opId) throw new Error("Нет ID");
+    if (!opId) throw new Error("Нет ID задачи");
+    addHistory(chatId, { index: "remix", model: "Remix (GoogleFX)", prompt, opId, endpoint: "/api/v4/flow/image/remix", body, isImage: true, ratio: s.ratio });
     const result = await pollResult(opId);
+    spendBalance("images", 1);
+    await bot.editMessageText("✅ Remix готов!", { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
     if (result) {
-      await bot.editMessageText("✅ Готово!", { chat_id: chatId, message_id: statusMsg.message_id });
-      await sendMedia(chatId, result, false, `🎞 Ключ. кадры\n📝 _${prompt.slice(0,100)}_`);
+      const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
+      await sendMedia(chatId, result, true, `🎨 Remix\n📝 _${prompt.slice(0, 100)}_`, regenKb);
     }
   } catch(e) {
-    await bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+    const errStr = e.response?.data?.detail || e.message;
+    await bot.editMessageText(`❌ Remix ошибка: ${String(errStr).slice(0,200)}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(()=>{});
   }
+  s.remixImages = [];
   showMainMenu(chatId);
 }
 
