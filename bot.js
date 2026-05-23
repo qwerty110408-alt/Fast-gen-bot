@@ -117,7 +117,7 @@ async function getUsageData() {
         headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
       });
       console.log(`[balance OK] endpoint=${ep}`);
-      console.log(`[balance FULL]`, JSON.stringify(data).slice(0, 2000));
+      console.log(`[balance FULL]`, (JSON.stringify(data) || "").slice(0, 2000));
       return data;
     } catch(e) {
       console.log(`[balance FAIL] endpoint=${ep} status=${e.response?.status} msg=${e.message}`);
@@ -142,8 +142,9 @@ function getLim(v) {
 function formatBalance(usage) {
   if (!usage) return "❌ Не удалось получить баланс";
 
-  const cur    = usage.currentusage  || usage.current_usage || usage;
-  const lim    = usage.accountlimits || usage.account_limits || usage;
+  const cur    = (usage.currentusage  || usage.current_usage || usage) ?? {};
+  const lim    = (usage.accountlimits || usage.account_limits || {});
+  const limObj = (lim && typeof lim === "object") ? lim : {};
 
   // win может быть массивом — берём первый объект-элемент или сам объект
   const winRaw = usage.usagewindow || usage.usage_window || {};
@@ -152,26 +153,28 @@ function formatBalance(usage) {
     : winRaw;
 
   // hourly может лежать в разных местах
-  const hourly =
+  const hourlyRaw =
     cur.hourlyusage  ||
     cur.hourly_usage ||
     cur.hourly       ||
     cur.usage        ||
     cur;
+  const hourly = (hourlyRaw && typeof hourlyRaw === "object") ? hourlyRaw : {};
 
   // image/video generation: проверяем hourly, cur, верхний уровень
-  const imgRaw = hourly.image_generation ?? cur.image_generation ?? usage.image_generation;
-  const vidRaw = hourly.video_generation ?? cur.video_generation ?? usage.video_generation;
-  const thrRaw = cur.activethreads ?? cur.active_threads ?? hourly.activethreads;
+  const curObj = (cur && typeof cur === "object") ? cur : {};
+  const imgRaw = hourly.image_generation ?? curObj.image_generation ?? usage.image_generation;
+  const vidRaw = hourly.video_generation ?? curObj.video_generation ?? usage.video_generation;
+  const thrRaw = curObj.activethreads ?? curObj.active_threads ?? hourly.activethreads;
 
   const imgUsed  = getVal(imgRaw) ?? "?";
-  const imgTotal = getLim(imgRaw) ?? lim.img_gen_per_hour_limit ?? lim.image_generation ?? "?";
+  const imgTotal = getLim(imgRaw) ?? limObj.img_gen_per_hour_limit ?? limObj.image_generation ?? "?";
   const vidUsed  = getVal(vidRaw) ?? "?";
-  const vidTotal = getLim(vidRaw) ?? lim.video_gen_per_hour_limit ?? lim.video_generation ?? "?";
+  const vidTotal = getLim(vidRaw) ?? limObj.video_gen_per_hour_limit ?? limObj.video_generation ?? "?";
 
   const tokRaw   = hourly.prompt_generation ?? cur.prompt_generation;
   const tokUsed  = getVal(tokRaw);
-  const tokTotal = getLim(tokRaw) ?? lim.prompt_tokens_per_hour_limit ?? null;
+  const tokTotal = getLim(tokRaw) ?? limObj.prompt_tokens_per_hour_limit ?? null;
 
   // Потоки: activethreads может быть {image_generation: N, video_generation: N} или числом
   let imgThreadsUsed = null, vidThreadsUsed = null;
@@ -182,8 +185,8 @@ function formatBalance(usage) {
     imgThreadsUsed = thrRaw;
     vidThreadsUsed = thrRaw;
   }
-  const imgThreadsMax = lim.img_generation_threads_allowed ?? lim.image_generation_threads_allowed ?? null;
-  const vidThreadsMax = lim.video_generation_threads_allowed ?? lim.videogenerationthreadsallowed ?? null;
+  const imgThreadsMax = limObj.img_generation_threads_allowed ?? limObj.image_generation_threads_allowed ?? null;
+  const vidThreadsMax = limObj.video_generation_threads_allowed ?? limObj.videogenerationthreadsallowed ?? null;
 
   // Reset time
   const resetMin = (
@@ -210,13 +213,16 @@ function formatBalance(usage) {
   // Debug: показываем сырые данные если не удалось прочитать
   const debugParts = [];
   if (imgUsed === "?" || imgTotal === "?")
-    debugParts.push(`[img raw: ${JSON.stringify(imgRaw).slice(0, 80)}]`);
+    debugParts.push(`[img raw: ${(JSON.stringify(imgRaw) || "undefined").slice(0, 80)}]`);
   if (vidUsed === "?" || vidTotal === "?")
-    debugParts.push(`[vid raw: ${JSON.stringify(vidRaw).slice(0, 80)}]`);
+    debugParts.push(`[vid raw: ${(JSON.stringify(vidRaw) || "undefined").slice(0, 80)}]`);
   if (resetStr === "?") {
-    const winKeys = Object.keys(win);
+    const winKeys = win && typeof win === "object" ? Object.keys(win) : [];
     if (winKeys.length > 0) debugParts.push(`[win keys: ${winKeys.join(", ")}]`);
-    else debugParts.push(`[hourly keys: ${Object.keys(hourly).join(", ").slice(0, 100)}]`);
+    else {
+      const hKeys = hourly && typeof hourly === "object" ? Object.keys(hourly).join(", ") : String(typeof hourly);
+      debugParts.push(`[hourly keys: ${hKeys.slice(0, 100)}]`);
+    }
   }
   const winDebug = debugParts.length > 0 ? `\n${debugParts.join("\n")}\n` : "";
 
