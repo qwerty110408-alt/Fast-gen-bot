@@ -123,46 +123,65 @@ User prompt: {TEXT}`;
 }
 
 async function enhancePrompt(rawPrompt, isVideo = false) {
+  const isVid = isVideo;
+  const systemPrompt = buildEnhanceSystemPrompt(isVid);
+  const fullPrompt = systemPrompt.replace("{TEXT}", rawPrompt);
   try {
-    const systemPrompt = buildEnhanceSystemPrompt(isVideo);
-    const fullPrompt = systemPrompt.replace("{TEXT}", rawPrompt);
     const { data } = await axios.post(`${BASE_URL}/api/v5/prompts/generate`, {
       prompt: fullPrompt,
     }, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
-      timeout: 30000,
+      timeout: 60000,
     });
 
-    // Если ответ сразу
-    if (data.text) return data.text.trim();
-    if (data.result?.text) return data.result.text.trim();
-    if (typeof data.result === "string" && data.result.length > 5) return data.result.trim();
+    console.log("[enhance] raw response:", JSON.stringify(data).slice(0, 500));
 
-    // Если вернул operation_id — поллим (как callLLM)
+    // Все возможные варианты ответа
+    if (data.text && data.text.trim()) return data.text.trim();
+    if (data.result?.text && data.result.text.trim()) return data.result.text.trim();
+    if (typeof data.result === "string" && data.result.trim().length > 10) return data.result.trim();
+    if (data.content && data.content.trim()) return data.content.trim();
+    if (data.response && data.response.trim()) return data.response.trim();
+    if (data.output && data.output.trim()) return data.output.trim();
+
+    // operation_id — поллим
     const opId = data.operation_id || data.task_id || data.id;
     if (opId) {
-      for (let i = 0; i < 20; i++) {
+      console.log("[enhance] polling opId:", opId);
+      for (let i = 0; i < 25; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        const { data: op } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
-          headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000,
-        });
-        const st = op.status || op.state;
-        if (["completed","success","done","finished"].includes(st)) {
-          const txt = op.result?.text || op.text || (typeof op.result === "string" ? op.result : null);
-          return txt ? txt.trim() : null;
-        }
-        if (["failed","error","cancelled"].includes(st)) {
-          console.log("[enhance] operation failed:", st, op.error || op.message || "");
-          return null;
+        try {
+          const { data: op } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
+            headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000,
+          });
+          const st = op.status || op.state;
+          console.log(`[enhance] poll ${i+1}: status=${st}`, JSON.stringify(op).slice(0,300));
+          if (["completed","success","done","finished"].includes(st)) {
+            const txt = op.result?.text || op.text || op.output || op.content
+              || (typeof op.result === "string" ? op.result : null);
+            if (txt && txt.trim()) return txt.trim();
+            // Ищем текст глубже в объекте
+            const all = JSON.stringify(op);
+            const match = all.match(/"(?:text|content|output|response)"\s*:\s*"([^"]{20,})"/);
+            if (match) return match[1].replace(/\\n/g,'\n').replace(/\\"/g,'"');
+            return null;
+          }
+          if (["failed","error","cancelled"].includes(st)) {
+            console.log("[enhance] failed:", op.error || op.message || st);
+            return null;
+          }
+        } catch(pollErr) {
+          console.log("[enhance] poll error:", pollErr.message);
         }
       }
-      console.log("[enhance] timeout after polling");
+      console.log("[enhance] polling timeout");
       return null;
     }
-    console.log("[enhance] unexpected response:", JSON.stringify(data).slice(0,200));
+
+    console.log("[enhance] no opId and no text in response");
     return null;
   } catch(e) {
-    console.log("[enhance] failed:", e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0,200) : e.message);
+    console.log("[enhance] request failed:", e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0,300) : e.message);
     return null;
   }
 }
@@ -888,23 +907,47 @@ function showPromptGenMenu(chatId, msgId = null) {
 
 async function callLLM(provider, apiKey, systemPrompt, userText) {
   if (provider === "fastgen") {
+    const fullPrompt = systemPrompt.replace("{TEXT}", userText);
     const { data } = await axios.post(`${BASE_URL}/api/v5/prompts/generate`, {
-      prompt: systemPrompt.replace("{TEXT}", userText),
-    }, { headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" }, timeout: 30000 });
-    if (data.operation_id || data.task_id || data.id) {
-      const opId = data.operation_id || data.task_id || data.id;
-      for (let i = 0; i < 20; i++) {
+      prompt: fullPrompt,
+    }, { headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" }, timeout: 60000 });
+
+    console.log("[callLLM] response keys:", Object.keys(data), "| snippet:", JSON.stringify(data).slice(0,300));
+
+    // Прямой ответ
+    if (data.text && data.text.trim()) return data.text.trim();
+    if (data.result?.text) return data.result.text.trim();
+    if (typeof data.result === "string" && data.result.trim().length > 5) return data.result.trim();
+    if (data.content && data.content.trim()) return data.content.trim();
+    if (data.response && data.response.trim()) return data.response.trim();
+    if (data.output && data.output.trim()) return data.output.trim();
+
+    // Поллинг
+    const opId = data.operation_id || data.task_id || data.id;
+    if (opId) {
+      for (let i = 0; i < 25; i++) {
         await new Promise(r => setTimeout(r, 3000));
         const { data: op } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
-          headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000
-        });
+          headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+        }).catch(() => ({ data: {} }));
         const st = op.status || op.state;
-        if (["completed","success","done","finished"].includes(st)) return op.result?.text || op.text || String(op.result || "");
+        console.log(`[callLLM] poll ${i+1} status=${st}`);
+        if (["completed","success","done","finished"].includes(st)) {
+          const txt = op.result?.text || op.text || op.output || op.content
+            || (typeof op.result === "string" ? op.result : null);
+          if (txt && txt.trim()) return txt.trim();
+          // Глубокий поиск строки в ответе
+          const raw = JSON.stringify(op);
+          const m = raw.match(/"(?:text|content|output|response)"\s*:\s*"([^"]{20,})"/);
+          if (m) return m[1].replace(/\\n/g,'\n').replace(/\\"/g,'"');
+          return String(op.result || "").trim() || null;
+        }
         if (["failed","error","cancelled"].includes(st)) throw new Error(`LLM: ${st}`);
       }
       throw new Error("LLM timeout");
     }
-    return data.text || data.result?.text || String(data.result || "");
+    console.log("[callLLM] no opId, no text — full response:", JSON.stringify(data).slice(0,400));
+    return String(data.result || "").trim() || null;
   }
   if (provider === "openai") {
     const { data } = await axios.post("https://api.openai.com/v1/chat/completions", {
