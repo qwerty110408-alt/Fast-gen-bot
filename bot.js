@@ -164,21 +164,35 @@ const videoScheduler = {};
 async function scheduleVideoChunk(chatId) {
   const job = videoScheduler[chatId];
   if (!job || job.tasks.length === 0) {
-    delete videoScheduler[chatId];
+    if (job) {
+      await bot.editMessageText(
+        `✅ *Почасовой пакет завершён!*\n✓${job.doneSoFar} ✗${job.errorsSoFar}`,
+        { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }
+      ).catch(()=>{});
+      delete videoScheduler[chatId];
+      showMainMenu(chatId);
+    }
     return;
   }
-  const { tasks, model, s } = job;
+
+  // Защита от двойного запуска — если уже работает, не запускаем снова
+  if (job.running) return;
+  job.running = true;
+
+  const { model, s } = job;
   const hourlyLimit = job.hourlyLimit || 15;
-  const chunk = tasks.splice(0, hourlyLimit); // берём до hourlyLimit задач
+
+  // Берём ровно hourlyLimit задач из начала массива
+  const chunk = job.tasks.splice(0, hourlyLimit);
   const total = job.totalTasks;
 
-  const { ratio: jobRatio, resolution: jobRes } = job.s;
+  const { ratio: jobRatio } = job.s;
   const statusText = () =>
     `⏰ *Почасовой пакет (видео)*\n` +
     `🤖 ${model.label} | 📐 ${jobRatio}\n` +
-    `Всего: ${total} | Осталось: ${job.tasks.length}\n` +
+    `Всего: ${total} | Осталось: ${job.tasks.length + (chunk.length - job.chunkDone)}\n` +
     `✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
-    `⚙️ Текущая пачка: ${chunk.length} задач (лимит/час: ${hourlyLimit})`;
+    `⚙️ Пачка: ${job.chunkDone}/${chunk.length} (лимит/час: ${hourlyLimit})`;
 
   if (!job.statusMsgId) {
     const m = await bot.sendMessage(chatId, statusText(), { parse_mode: "Markdown" });
@@ -187,15 +201,20 @@ async function scheduleVideoChunk(chatId) {
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
   }
 
-  // Запускаем все задачи чанка через очередь (макс 10 параллельно) и ЖДЁМ все
+  job.chunkDone = 0;
+
+  // Создаём свою очередь для этого чанка (10 параллельных), изолированно от глобальной
+  const chunkQueue = createQueue(10);
+
   const chunkPromises = chunk.map(task =>
-    videoQueue(async () => {
+    chunkQueue(async () => {
       try {
         await genOne(chatId, s, task.prompt, task.ep, model, task.isImg, 0, 0, task.idx, task.fileId);
         job.doneSoFar++;
       } catch {
         job.errorsSoFar++;
       }
+      job.chunkDone++;
       await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(()=>{});
     })
   );
@@ -203,17 +222,20 @@ async function scheduleVideoChunk(chatId) {
   // Ждём пока ВСЕ задачи чанка завершатся
   await Promise.allSettled(chunkPromises);
 
+  job.running = false;
+
   if (job.tasks.length > 0) {
-    // Сколько ждать до следующего сброса лимита
-    const msLeft = Math.max(60000, balanceState.resetAt - Date.now()); // минимум 1 мин чтобы не зациклиться
-    const waitMs = msLeft + 3000; // +3 сек буфер
+    // Ждём до следующего сброса часового лимита FastGen
+    const msLeft = Math.max(60000, balanceState.resetAt - Date.now());
+    const waitMs = msLeft + 5000; // +5 сек буфер
     const resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
     await bot.sendMessage(chatId,
-      `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
+      `⏳ *Пачка завершена:* ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
       `Осталось *${job.tasks.length}* задач.\n` +
       `🕐 Следующая пачка запустится в *${resetTime}* (сброс лимита).\n` +
       `Можно закрыть приложение — бот сам продолжит.`,
       { parse_mode: "Markdown" });
+    // Используем одиночный setTimeout — никаких повторных вызовов
     setTimeout(() => scheduleVideoChunk(chatId), waitMs);
   } else {
     await bot.editMessageText(
@@ -1833,9 +1855,10 @@ async function runBatch(chatId) {
   const tasks = [];
 
   if (isVideoImage) {
-    // Видео из фото: каждое фото + (промпт или "animate") × perPrompt
+    // Видео из фото: каждое фото × perPrompt вариаций
+    // Промпт берётся по индексу фото (циклически если промптов меньше)
     for (let fi = 0; fi < photos.length; fi++) {
-      const prompt = prompts[fi] || prompts[0] || "animate";
+      const prompt = prompts.length > 0 ? prompts[fi % prompts.length] : "animate";
       for (let vi = 0; vi < perPrompt; vi++)
         tasks.push({ prompt, idx: `ф${fi+1}.${vi+1}`, ep: model.epI || model.epT, isImg: false, fileId: photos[fi] });
     }
@@ -1975,7 +1998,8 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     else spendBalance("videos", 1);
 
     const idxStr = batchIdx ? `*${batchIdx}* ` : "";
-    const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0,100)}_`;
+    const promptDisplay = prompt.length > 900 ? prompt.slice(0, 900) + "…" : prompt;
+    const caption = `${idxStr}${model.label}\n📝 _${promptDisplay}_`;
     const regenKb = { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${histIdx}` }]] };
 
     if (result) {
