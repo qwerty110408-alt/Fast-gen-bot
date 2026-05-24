@@ -103,56 +103,66 @@ async function cancelOperation(opId) {
 }
 
 // ─── Улучшение промпта через FastGen LLM ─
-// Умный системный промпт — адаптируется под тип контента
 function buildEnhanceSystemPrompt(isVideo) {
   const mediaType = isVideo ? "video generation" : "image generation";
-  return `You are an expert prompt engineer for AI ${mediaType} models (like Imagen, Veo, Grok, DALL-E).
+  return `You are an expert prompt engineer for AI ${mediaType} models (Imagen, Veo, Grok, DALL-E).
 
-Your task: take the user's raw prompt and rewrite it into a highly detailed, optimized prompt for ${mediaType}.
+Take the user's raw prompt and rewrite it into a highly detailed, optimized prompt.
 
 Rules:
-- Detect the content type automatically: portrait, landscape, abstract, anime, realistic, cinematic, product, fantasy, sci-fi, etc.
-- For portraits: add lighting details (soft rim light, golden hour), camera angle, skin details, expression, background blur
-- For landscapes/nature: add atmosphere, time of day, weather, depth, color palette
-- For cinematic/action: add camera movement${isVideo ? " (slow zoom, pan, dolly)" : ""}, color grade, film style
-- For abstract/artistic: add style references, texture, mood, color theory
-- For anime/illustration: add art style (Studio Ghibli, manga, etc.), line quality, color vibrancy
-${isVideo ? "- For video: add motion description, camera movement, transition style, pacing" : ""}
-- Always add: quality boosters (photorealistic, 8K, sharp focus, professional photography, award-winning)
-- Keep the core idea intact — only expand and improve, never change the subject
-- Output ONLY the improved prompt, nothing else, no explanations, no preamble`;
+- Detect content type: portrait, landscape, cinematic, anime, abstract, sci-fi, fantasy, product, etc.
+- For portraits: add lighting (soft rim light, golden hour), camera angle, expression, background
+- For landscapes: add atmosphere, time of day, weather, depth, color palette
+- For cinematic: add color grade, film style${isVideo ? ", camera movement (slow zoom, pan, dolly), pacing" : ""}
+- For anime/illustration: add art style, line quality, color vibrancy
+- Always add quality boosters: photorealistic, 8K, sharp focus, professional, award-winning
+- Keep core idea intact — only expand, never change the subject
+- Output ONLY the improved prompt. No explanations, no preamble, no quotes.
+
+User prompt: {TEXT}`;
 }
 
 async function enhancePrompt(rawPrompt, isVideo = false) {
-  const systemPrompt = buildEnhanceSystemPrompt(isVideo);
   try {
+    const systemPrompt = buildEnhanceSystemPrompt(isVideo);
+    const fullPrompt = systemPrompt.replace("{TEXT}", rawPrompt);
     const { data } = await axios.post(`${BASE_URL}/api/v5/prompts/generate`, {
-      prompt: `${systemPrompt}\n\nUser prompt to improve: ${rawPrompt}`,
+      prompt: fullPrompt,
     }, {
       headers: { "X-API-Key": FASTGEN_API_KEY, "Content-Type": "application/json" },
       timeout: 30000,
     });
-    // v5 может вернуть сразу текст или operation_id
+
+    // Если ответ сразу
     if (data.text) return data.text.trim();
     if (data.result?.text) return data.result.text.trim();
-    // Если вернул operation_id — поллим
+    if (typeof data.result === "string" && data.result.length > 5) return data.result.trim();
+
+    // Если вернул operation_id — поллим (как callLLM)
     const opId = data.operation_id || data.task_id || data.id;
     if (opId) {
-      for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 3000));
         const { data: op } = await axios.get(`${BASE_URL}/api/v4/operations/${opId}`, {
           headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 10000,
         });
         const st = op.status || op.state;
         if (["completed","success","done","finished"].includes(st)) {
-          return (op.result?.text || op.text || String(op.result || "")).trim();
+          const txt = op.result?.text || op.text || (typeof op.result === "string" ? op.result : null);
+          return txt ? txt.trim() : null;
         }
-        if (["failed","error","cancelled"].includes(st)) throw new Error("LLM failed");
+        if (["failed","error","cancelled"].includes(st)) {
+          console.log("[enhance] operation failed:", st, op.error || op.message || "");
+          return null;
+        }
       }
+      console.log("[enhance] timeout after polling");
+      return null;
     }
+    console.log("[enhance] unexpected response:", JSON.stringify(data).slice(0,200));
     return null;
   } catch(e) {
-    console.log("[enhance] failed:", e.message);
+    console.log("[enhance] failed:", e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0,200) : e.message);
     return null;
   }
 }
@@ -825,21 +835,23 @@ function showRegenMenu(chatId, histIdx) {
 
   const isImage = item.isImage;
   const s = getState(chatId);
+  const idxLabel = item.index ? ` [${item.index}]` : "";
+  const promptFull = item.prompt || "(нет промпта)";
 
   const text =
-    `🔄 *Перегенерировать*\n\n` +
-    `📝 Промпт:\n_${item.prompt.slice(0,200)}_\n\n` +
+    `🔄 *Перегенерировать${idxLabel}*\n\n` +
+    `📝 *Промпт:*\n_${promptFull.length > 400 ? promptFull.slice(0,400) + "…" : promptFull}_\n\n` +
     `🤖 Модель: *${item.model}*\n` +
     `📐 Соотношение: *${item.ratio || s.ratio}*`;
 
   const modelRows = isImage
-    ? Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text: v.label, callback_data: `regen_run_${histIdx}_im_${k}` }])
-    : Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text: v.label, callback_data: `regen_run_${histIdx}_vm_${k}` }]);
+    ? Object.entries(IMAGE_MODELS).map(([k,v]) => [{ text: item.model === v.label ? `✅ ${v.label}` : v.label, callback_data: `regen_run_${histIdx}_im_${k}` }])
+    : Object.entries(VIDEO_MODELS).map(([k,v]) => [{ text: item.model === v.label ? `✅ ${v.label}` : v.label, callback_data: `regen_run_${histIdx}_vm_${k}` }]);
 
   const kb = { inline_keyboard: [
+    [{ text: "🔄 Та же модель", callback_data: `regen_same_${histIdx}` }],
     [{ text: "✏️ Изменить промпт", callback_data: `regen_edit_${histIdx}` }],
     ...modelRows,
-    [{ text: "🔄 Та же модель", callback_data: `regen_same_${histIdx}` }],
     [{ text: "❌ Отмена", callback_data: "back_menu" }],
   ]};
 
@@ -1329,17 +1341,38 @@ bot.on("callback_query", async (query) => {
     if (s.pendingMsgId) await bot.deleteMessage(chatId, s.pendingMsgId).catch(()=>{});
     s.pendingPrompt = null; s.pendingMsgId = null; s.pendingGenKey = null;
     if (!genFn || !rawPrompt) return showMainMenu(chatId);
+
     const waitMsg = await bot.sendMessage(chatId, "✨ Улучшаю промпт...");
     const enhanced = await enhancePrompt(rawPrompt, isVideo);
     await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
-    if (enhanced && enhanced !== rawPrompt) {
+
+    if (enhanced && enhanced.trim() !== rawPrompt.trim()) {
+      // Сохраняем оба промпта и genFn для выбора
+      const compareKey = `cmp_${Date.now()}`;
+      pendingGenerators.set(compareKey + "_orig", genFn);
+      pendingGenerators.set(compareKey + "_new", genFn);
+      s.pendingCompareKey = compareKey;
+      s.pendingOrigPrompt = rawPrompt;
+      s.pendingEnhPrompt = enhanced;
+
+      const oldShort = rawPrompt.length > 200 ? rawPrompt.slice(0,200) + "…" : rawPrompt;
+      const newShort = enhanced.length > 300 ? enhanced.slice(0,300) + "…" : enhanced;
       await bot.sendMessage(chatId,
-        `✨ *Промпт улучшен:*\n_${enhanced.slice(0,300)}${enhanced.length>300?"...":""}_`,
-        { parse_mode: "Markdown" }
+        `✨ *Промпт улучшен!*\n\n` +
+        `*Оригинал:*\n_${oldShort}_\n\n` +
+        `*Улучшенный:*\n_${newShort}_`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [
+            [{ text: "✅ Использовать новый", callback_data: `enhance_pick_new_${compareKey}` }],
+            [{ text: "↩️ Оставить оригинал", callback_data: `enhance_pick_orig_${compareKey}` }],
+          ]}
+        }
       );
-      pendingGenerators.delete(genKey);
-      return genFn(enhanced);
+      return;
     }
+    // Улучшение не дало результата — идём с оригиналом
+    await bot.sendMessage(chatId, "⚠️ Улучшение не дало результата, использую оригинал.");
     pendingGenerators.delete(genKey);
     return genFn(rawPrompt);
   }
@@ -1352,6 +1385,21 @@ bot.on("callback_query", async (query) => {
     if (!genFn || !rawPrompt) return showMainMenu(chatId);
     pendingGenerators.delete(genKey);
     return genFn(rawPrompt);
+  }
+
+  // ── Выбор после сравнения улучшенного промпта
+  if (data.startsWith("enhance_pick_new_") || data.startsWith("enhance_pick_orig_")) {
+    const isNew = data.startsWith("enhance_pick_new_");
+    const compareKey = data.replace(/enhance_pick_(new|orig)_/, "");
+    const genFn = pendingGenerators.get(compareKey + (isNew ? "_new" : "_orig"));
+    const chosenPrompt = isNew ? s.pendingEnhPrompt : s.pendingOrigPrompt;
+    pendingGenerators.delete(compareKey + "_new");
+    pendingGenerators.delete(compareKey + "_orig");
+    s.pendingCompareKey = null; s.pendingOrigPrompt = null; s.pendingEnhPrompt = null;
+    if (!genFn || !chosenPrompt) return showMainMenu(chatId);
+    // Удаляем сообщение со сравнением
+    await bot.deleteMessage(chatId, msgId).catch(()=>{});
+    return genFn(chosenPrompt);
   }
 
   // ── Отмена всех операций
@@ -1679,12 +1727,28 @@ async function handlePromptAndGenerate(chatId, s, rawPrompt, generatorFn) {
     const waitMsg = await bot.sendMessage(chatId, "✨ Улучшаю промпт...", {});
     const enhanced = await enhancePrompt(rawPrompt, isVideo);
     await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
-    if (enhanced && enhanced !== rawPrompt) {
-      await bot.sendMessage(chatId,
-        `✨ *Промпт улучшен:*\n_${enhanced.slice(0, 300)}${enhanced.length > 300 ? "..." : ""}_`,
-        { parse_mode: "Markdown" }
+    if (enhanced && enhanced.trim() !== rawPrompt.trim()) {
+      // Показываем сравнение
+      const compareKey = `cmp_${Date.now()}`;
+      pendingGenerators.set(compareKey + "_orig", generatorFn);
+      pendingGenerators.set(compareKey + "_new", generatorFn);
+      s.pendingCompareKey = compareKey;
+      s.pendingOrigPrompt = rawPrompt;
+      s.pendingEnhPrompt = enhanced;
+      const oldShort = rawPrompt.length > 200 ? rawPrompt.slice(0,200) + "…" : rawPrompt;
+      const newShort = enhanced.length > 300 ? enhanced.slice(0,300) + "…" : enhanced;
+      return bot.sendMessage(chatId,
+        `✨ *Промпт улучшен!*\n\n` +
+        `*Оригинал:*\n_${oldShort}_\n\n` +
+        `*Улучшенный:*\n_${newShort}_`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [
+            [{ text: "✅ Использовать новый", callback_data: `enhance_pick_new_${compareKey}` }],
+            [{ text: "↩️ Оставить оригинал", callback_data: `enhance_pick_orig_${compareKey}` }],
+          ]}
+        }
       );
-      return generatorFn(enhanced);
     }
     return generatorFn(rawPrompt);
   }
@@ -2032,14 +2096,19 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
     addHistory(chatId, { index: label||"err", model: model.label, prompt, opId: "error", endpoint, body, isImage, ratio: s.ratio });
     const errHistIdx = 0;
 
+    const labelStr = label ? ` [${label}]` : "";
+    const promptShort = prompt.length > 300 ? prompt.slice(0,300) + "…" : prompt;
     await bot.sendMessage(chatId,
-      `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n` +
-      `🤖 ${model.label}\n` +
-      `${errStatus ? `Код: \`${errStatus.trim()}\`\n` : ""}` +
-      `Причина: \`${errStr.slice(0,300)}\``,
+      `❌ *Ошибка генерации${labelStr}*\n` +
+      `🤖 ${model.label}${errStatus ? ` | Код: \`${errStatus.trim()}\`` : ""}\n` +
+      `📋 Причина: \`${errStr.slice(0,250)}\`\n\n` +
+      `📝 *Промпт:*\n_${promptShort}_`,
       {
         parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${errHistIdx}` }]] }
+        reply_markup: { inline_keyboard: [
+          [{ text: "🔄 Перегенерировать", callback_data: `show_regen_${errHistIdx}` }],
+          [{ text: "✏️ Изменить промпт", callback_data: `regen_edit_${errHistIdx}` }],
+        ]}
       }
     );
     throw e;
