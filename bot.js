@@ -424,6 +424,7 @@ const VIDEO_MODELS = {
   "veo31_quality": { label: "Veo 3.1 Quality", epT: "/api/v4/flow/video/from-text",   epI: "/api/v4/flow/video/from-ingredients",   epK: "/api/v4/flow/video/from-keyframes", sub: "veo-3.1-quality", credits: "10 кред = 1 видео ⚠️", cost: 10 },
   "grok_vid":      { label: "Grok Video",       epT: "/api/v4/grok/video/from-text",   epI: "/api/v4/grok/video/from-image",         credits: "1 кред = 1 видео",   cost: 1, res: true, defaultRes: "720p" },
   "veo31_flower":  { label: "Veo 3.1 Flower",  epT: "/api/v4/flower/video/from-text", epI: "/api/v4/flower/video/from-image",       credits: "1 кред = 1 видео",   cost: 1 },
+  "gemini_omni_flash": { label: "Gemini Omni Flash", epT: "/api/v4/flow/video/from-text", epI: "/api/v4/flow/video/from-ingredients", sub: "gemini-2.0-flash", credits: "1 кред (4-8s) / 2 кред (10s)", cost: 1, hasDuration: true, defaultDuration: 8 },
 };
 
 const RATIOS = ["16:9","9:16","1:1","4:3","3:4","3:2","2:3"];
@@ -455,6 +456,8 @@ const DEFAULT_STATE = () => ({
   // Remix
   remixImages: [], // [{fileId, category}]
   remixStep: null,
+  // Gemini Omni Flash duration
+  geminiDuration: 8,
 });
 
 const userState = {};
@@ -489,6 +492,7 @@ function saveState(chatId) {
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
     enhanceMode: s.enhanceMode,
+    geminiDuration: s.geminiDuration,
   };
   saveJSON(STATE_FILE, persistedStates);
 }
@@ -624,10 +628,15 @@ async function showMainMenu(chatId) {
   const im = IMAGE_MODELS[s.imgModel];
   const vm = VIDEO_MODELS[s.vidModel];
   const enhanceLabel = { always: "✨ Всегда", never: "⏭ Никогда", ask: "❓ Спрашивать" }[s.enhanceMode || "ask"];
+  const vmCredits = (vm.hasDuration && (s.geminiDuration || vm.defaultDuration) === 10)
+    ? "2 кред = 1 видео (10s)"
+    : vm.hasDuration
+      ? `1 кред = 1 видео (${s.geminiDuration || vm.defaultDuration}s)`
+      : vm.credits;
   const text =
     `🤖 *FastGen Bot*\n\n` +
     `🖼 Фото: *${im.label}*\n└ ${im.credits}\n` +
-    `🎬 Видео: *${vm.label}*\n└ ${vm.credits}\n` +
+    `🎬 Видео: *${vm.label}*\n└ ${vmCredits}\n` +
     `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed==="fixed"?"Фикс.":"Случ."}\n` +
     `✨ Улучшение промпта: *${enhanceLabel}*`;
   const kb = { inline_keyboard: [
@@ -662,6 +671,7 @@ function showMiscMenu(chatId, msgId = null) {
     [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }, { text: "🎨 Remix", callback_data: "do_remix" }],
     [{ text: seedLabel, callback_data: "open_seed" }],
     ...(s.vidModel === "grok_vid" ? [[{ text: `🖥 Разрешение Grok: ${s.resolution || "720p"}`, callback_data: "open_resolution" }]] : []),
+    ...(s.vidModel === "gemini_omni_flash" ? [[{ text: `⏱ Длительность Gemini: ${s.geminiDuration || 8}s${(s.geminiDuration||8)===10?" (2 кред)":""}`, callback_data: "open_gemini_duration" }]] : []),
     [{ text: `✨ Промпт: ${enhanceLabel}`, callback_data: "open_enhance" }],
     [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
     [{ text: "📋 История запросов", callback_data: "show_history" }],
@@ -1410,6 +1420,24 @@ bot.on("callback_query", async (query) => {
   }
   if (data.startsWith("set_res_")) { s.resolution=data.replace("set_res_",""); saveState(chatId); del(); return showMainMenu(chatId); }
 
+  // ── Длительность Gemini Omni Flash
+  if (data === "open_gemini_duration") {
+    const cur = s.geminiDuration || 8;
+    return edit(
+      `⏱ *Длительность Gemini Omni Flash*\n\nСейчас: *${cur}s*${cur===10?" (2 кредита ⚠️)":""}\n\n4s, 6s, 8s — 1 кредит\n10s — 2 кредита`,
+      { inline_keyboard: [
+        [4, 6, 8].map(n => ({ text: cur===n?`✅ ${n}s`:`${n}s`, callback_data:`set_gd_${n}` })),
+        [{ text: cur===10?"✅ 10s (2 кред) ⚠️":"10s (2 кред) ⚠️", callback_data:"set_gd_10" }],
+        [{ text:"◀️ Назад", callback_data:"open_misc" }],
+      ]}
+    );
+  }
+  if (data.startsWith("set_gd_")) {
+    s.geminiDuration = parseInt(data.replace("set_gd_",""));
+    saveState(chatId);
+    return showMiscMenu(chatId, msgId);
+  }
+
   // ── Улучшение промпта — настройки
   if (data === "open_enhance") { return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_always") { s.enhanceMode="always"; saveState(chatId); return showEnhanceMenu(chatId, msgId); }
@@ -2092,15 +2120,22 @@ async function runBatch(chatId) {
 // ─── Одна задача ──────────────────────────
 async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total, batchIdx=null, overrideFileId=null) {
   const label = batchIdx || (total>1 ? `${index}/${total}` : "");
+  // Объявляем body ВНЕ try чтобы catch всегда имел к нему доступ
+  let body = {};
+  let errHistIdx = 0;
   try {
-    const body = {
+    body = {
       prompt, aspect_ratio: s.ratio,
       ...(model.sub && { model: model.sub }),
       ...(model.model && { model: model.model }),
       ...(model.quality && { quality: model.quality }),
       ...(model.res && { resolution: s.resolution || model.defaultRes || "720p" }),
       ...(s.seed === "fixed" && { seed: 42 }),
+      // Длительность для Gemini Omni Flash
+      ...(model.hasDuration && { duration: s.geminiDuration || model.defaultDuration || 8 }),
     };
+    // Стоимость Gemini Omni Flash: 10s = 2 кредита
+    const actualCost = (model.hasDuration && (s.geminiDuration || model.defaultDuration) === 10) ? 2 : (model.cost || 1);
     const fid = overrideFileId || s.fileId;
     if (fid) {
       const f = await bot.getFile(fid);
@@ -2137,17 +2172,18 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
 
     const histEntry = { index: batchIdx||label, model: model.label, prompt, opId, endpoint, body, isImage, ratio: s.ratio };
     addHistory(chatId, histEntry);
-    const histIdx = 0; // только что добавили в начало
+    const histIdx = 0; // только что добавили в начало (unshift)
 
     const result = await pollResult(opId);
 
     // Списываем баланс
-    if (isImage) spendBalance("images", 1);
-    else spendBalance("videos", 1);
+    if (isImage) spendBalance("images", actualCost);
+    else spendBalance("videos", actualCost);
 
+    const durationLabel = (model.hasDuration && body.duration) ? ` | ${body.duration}s` : "";
     const idxStr = batchIdx ? `*${batchIdx}* ` : "";
     const promptDisplay = prompt.length > 900 ? prompt.slice(0, 900) + "…" : prompt;
-    const caption = `${idxStr}${model.label}\n📝 _${promptDisplay}_`;
+    const caption = `${idxStr}${model.label}${durationLabel}\n📝 _${promptDisplay}_`;
     const regenKb = { inline_keyboard: [[{ text:"🔄 Перегенерировать", callback_data:`show_regen_${histIdx}` }]] };
 
     if (result) {
@@ -2178,7 +2214,7 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
 
     // Сохраняем в историю для перегенерации даже при ошибке
     addHistory(chatId, { index: label||"err", model: model.label, prompt, opId: "error", endpoint, body, isImage, ratio: s.ratio });
-    const errHistIdx = 0;
+    errHistIdx = 0; // только что добавили в начало
 
     const labelStr = label ? ` [${label}]` : "";
     const promptShort = prompt.length > 300 ? prompt.slice(0,300) + "…" : prompt;
