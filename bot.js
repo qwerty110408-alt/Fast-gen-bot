@@ -1,12 +1,53 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const fs = require("fs");
+const http = require("http");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
 const BASE_URL = "https://googler.fast-gen.ai";
 const STORAGE_URL = "https://storage.fast-gen.ai";
+const PORT = process.env.PORT || 3000;
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// ─── HTTP прокси для Mini App (обходит CORS) ─
+const server = http.createServer(async (req, res) => {
+  // CORS заголовки
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization");
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+  // Только /proxy?path=...
+  if (!req.url.startsWith("/proxy")) { res.writeHead(404); res.end("Not found"); return; }
+
+  const urlObj = new URL(req.url, `http://localhost:${PORT}`);
+  const path = urlObj.searchParams.get("path");
+  if (!path) { res.writeHead(400); res.end(JSON.stringify({error:"No path"})); return; }
+
+  const apiKey = req.headers["x-api-key"] || FASTGEN_API_KEY;
+  const targetUrl = BASE_URL + "/" + path.replace(/^\//, "");
+
+  let body = "";
+  req.on("data", chunk => body += chunk);
+  req.on("end", async () => {
+    try {
+      const resp = await axios({
+        method: req.method,
+        url: targetUrl,
+        headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+        data: body || undefined,
+        timeout: 120000,
+        validateStatus: () => true,
+      });
+      res.writeHead(resp.status, { "Content-Type": "application/json" });
+      res.end(typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data));
+    } catch(e) {
+      res.writeHead(500); res.end(JSON.stringify({error: e.message}));
+    }
+  });
+});
+server.listen(PORT, () => console.log(`[proxy] listening on port ${PORT}`));
 
 // ─── Персистентное состояние ──────────────
 const STATE_FILE = "./user_states.json";
