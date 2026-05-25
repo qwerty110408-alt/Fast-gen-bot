@@ -2154,9 +2154,15 @@ async function genOne(chatId, s, prompt, endpoint, model, isImage, index, total,
         } catch(e) { console.log("[ref] skip failed ref:", e.message); }
       }
       if (refImages.length > 0) {
-        if (s.tab === "image_ref") body.reference_images = refImages;
-        else if (s.tab === "video_ref") body.images = refImages;
-        console.log(`[refs] sending ${refImages.length} refs, tab=${s.tab}, field=${s.tab==="image_ref"?"reference_images":"images"}`);
+        if (s.tab === "image_ref") {
+          body.reference_images = refImages;
+        } else if (s.tab === "video_ref") {
+          // Gemini Omni Flash (hasDuration) требует reference_images, остальные — images
+          if (model.hasDuration) body.reference_images = refImages;
+          else body.images = refImages;
+        }
+        const fieldUsed = (s.tab === "image_ref" || model.hasDuration) ? "reference_images" : "images";
+        console.log(`[refs] sending ${refImages.length} refs, tab=${s.tab}, model=${model.label}, field=${fieldUsed}`);
       }
     }
 
