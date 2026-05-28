@@ -174,11 +174,13 @@ User prompt: ${rawPrompt}`;
 // ─── Баланс ───────────────────────────────
 const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
 
+// Сброс лимита происходит каждый час по UTC (14:00, 15:00, 16:00...)
+// Считаем миллисекунды до следующей круглой UTC-минуты xx:00:00.000
 function nextHourReset() {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(now.getHours() + 1, 0, 0, 0);
-  return next.getTime();
+  const now = Date.now();
+  // Следующий UTC-час: округляем вверх до начала следующего часа
+  const msPerHour = 60 * 60 * 1000;
+  return Math.ceil((now + 1) / msPerHour) * msPerHour;
 }
 
 let balanceState = loadJSON(BALANCE_FILE, { images: 0, videos: 0, tokens: 0, resetAt: nextHourReset() });
@@ -777,13 +779,15 @@ async function scheduleVideoChunk(chatId) {
   await Promise.allSettled(chunkPromises);
 
   if (job.tasks.length > 0) {
-    const msLeft = Math.max(60000, balanceState.resetAt - Date.now());
-    const waitMs = msLeft + 3000;
+    // Ждём до следующего UTC-часового сброса (например 14:00→15:00 UTC)
+    checkResetBalance();
+    const msLeft = Math.max(5000, balanceState.resetAt - Date.now());
+    const waitMs = msLeft + 3000; // +3 сек буфер после сброса
     const resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
     await bot.sendMessage(chatId,
       `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
       `Осталось *${job.tasks.length}* задач.\n` +
-      `🕐 Следующая пачка в *${resetTime}* (сброс лимита).\n` +
+      `🕐 Следующая пачка в *${resetTime}* UTC (сброс лимита).\n` +
       `Можно закрыть приложение — бот продолжит.`,
       { parse_mode: "Markdown" });
     setTimeout(() => scheduleVideoChunk(chatId), waitMs);
@@ -1025,12 +1029,22 @@ async function runBatch(chatId) {
   if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
   if (isVideoImage && photos.length === 0) return bot.sendMessage(chatId, "❌ Добавь фото для режима «Видео из фото»!");
 
-  // Конвертируем фото в base64 data URI (не storage — чтобы не протухли за 1 час)
+  // Конвертируем фото в base64 data URI — по 5 параллельно чтобы не перегружать Telegram API
   let photoRefs = [];
   if (isVideoImage && photos.length > 0) {
     const uploadMsg = await bot.sendMessage(chatId, `⏳ Подготавливаю ${photos.length} фото...`);
     try {
-      photoRefs = await Promise.all(photos.map(fid => tgPhotoToDataUri(fid)));
+      for (let i = 0; i < photos.length; i += 5) {
+        const chunk = photos.slice(i, i + 5);
+        const results = await Promise.allSettled(chunk.map(fid => tgPhotoToDataUri(fid)));
+        for (const r of results) {
+          if (r.status === "fulfilled") photoRefs.push(r.value);
+          else throw new Error(`Ошибка загрузки фото ${photoRefs.length + 1}: ${r.reason?.message || r.reason}`);
+        }
+        await bot.editMessageText(`⏳ Подготовлено ${photoRefs.length}/${photos.length} фото...`, {
+          chat_id: chatId, message_id: uploadMsg.message_id
+        }).catch(() => {});
+      }
       await bot.editMessageText(`✅ Фото готовы (${photoRefs.length})`, { chat_id: chatId, message_id: uploadMsg.message_id });
     } catch(e) {
       await bot.editMessageText(`❌ Ошибка загрузки фото: ${e.message}`, { chat_id: chatId, message_id: uploadMsg.message_id });
