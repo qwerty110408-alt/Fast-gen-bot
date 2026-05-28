@@ -1,6 +1,7 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const fs = require("fs");
+const FormData = require("form-data");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
@@ -46,7 +47,6 @@ const videoQueue = createQueue(10);
 
 // ─── Storage upload ───────────────────────
 async function uploadToStorage(buffer, filename = "image.jpg") {
-  const FormData = require("form-data");
   const form = new FormData();
   form.append("file", buffer, { filename, contentType: "image/jpeg" });
   const { data } = await axios.post(`${STORAGE_URL}/upload`, form, {
@@ -86,7 +86,6 @@ async function v5Create(body) {
   return data;
 }
 
-// ИСПРАВЛЕНИЕ 4: увеличен таймаут поллинга до 30 минут (180 попыток × 10сек)
 async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(r => setTimeout(r, interval));
@@ -102,13 +101,14 @@ async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
     }
     const st = data.status;
     console.log(`[poll] id=${genId} attempt=${i} status=${st}`);
-    if (st === "succeeded") return data.results || [];
+    if (st === "succeeded") return { results: data.results || [], usage: data.usage };
     if (st === "failed") {
       const reason = data.error || JSON.stringify(data).slice(0, 300);
-      throw new Error(`Generation failed: ${reason}`);
+      const refunded = data.usage?.refunded || false;
+      throw new Error(`Generation failed: ${reason}|REFUNDED:${refunded}`);
     }
   }
-  throw new Error("Generation timed out after polling");
+  throw new Error("Generation timed out after polling|REFUNDED:false");
 }
 
 async function sendV5Media(chatId, media, caption, replyMarkup = null) {
@@ -161,21 +161,28 @@ User prompt: ${rawPrompt}`;
 // ─── Баланс ───────────────────────────────
 const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
 
-function nextHourReset() {
-  const now = Date.now();
-  const msPerHour = 60 * 60 * 1000;
-  return Math.ceil((now + 1) / msPerHour) * msPerHour;
+function nextHourResetUTC() {
+  const now = new Date();
+  // Сброс в начале каждого часа по UTC (00:00, 01:00, 02:00, ...)
+  const nextHour = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    now.getUTCHours() + 1,
+    0, 0, 0
+  ));
+  return nextHour.getTime();
 }
 
-let balanceState = loadJSON(BALANCE_FILE, { images: 0, videos: 0, tokens: 0, resetAt: nextHourReset() });
+let balanceState = loadJSON(BALANCE_FILE, { images: 0, videos: 0, tokens: 0, resetAt: nextHourResetUTC() });
 if (!balanceState.resetAt || balanceState.resetAt < Date.now()) {
-  balanceState = { images: 0, videos: 0, tokens: 0, resetAt: nextHourReset() };
+  balanceState = { images: 0, videos: 0, tokens: 0, resetAt: nextHourResetUTC() };
   saveJSON(BALANCE_FILE, balanceState);
 }
 
 function checkResetBalance() {
   if (Date.now() >= balanceState.resetAt) {
-    balanceState = { images: 0, videos: 0, tokens: 0, resetAt: nextHourReset() };
+    balanceState = { images: 0, videos: 0, tokens: 0, resetAt: nextHourResetUTC() };
     saveJSON(BALANCE_FILE, balanceState);
   }
 }
@@ -184,6 +191,12 @@ function spendBalance(type, amount = 1) {
   checkResetBalance();
   balanceState[type] = (balanceState[type] || 0) + amount;
   saveJSON(BALANCE_FILE, balanceState);
+}
+
+function getTimeUntilNextHourUTC() {
+  const now = Date.now();
+  const nextReset = nextHourResetUTC();
+  return Math.max(0, nextReset - now);
 }
 
 async function formatBalance() {
@@ -195,7 +208,7 @@ async function formatBalance() {
   const totalMin = Math.ceil(msLeft / 60000);
   const h = Math.floor(totalMin / 60), m = totalMin % 60;
   const resetStr = h > 0 ? `${h}ч ${m}м` : `${m}м`;
-  const resetTime = new Date(b.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+  const resetTime = new Date(b.resetAt).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
 
   let realBlock = "";
   try {
@@ -217,7 +230,7 @@ async function formatBalance() {
     `📊 *Баланс*\n\n` +
     `🖼 Изображений осталось: *${imgLeft}/${HOURLY_LIMITS.images}*\n` +
     `🎬 Видео осталось: *${vidLeft}/${HOURLY_LIMITS.videos}*\n` +
-    `⏱ Сброс через: *${resetStr}* (в ${resetTime})\n` +
+    `⏱ Сброс через: *${resetStr}* (в ${resetTime} UTC)\n` +
     realBlock +
     `\n*Стоимость моделей:*\n` +
     `🖼 Imagen 4 / NanoPro / NanoBanana 2 (Flow): 4 кред\n` +
@@ -241,7 +254,6 @@ const IMAGE_MODELS = {
   "chatgpt":    { label: "ChatGPT Images",      operation: "openai_image_generate",           credits: "1 кред/фото" },
 };
 
-// ─── GROK VIDEO DURATION ──────────────────
 const GROK_DURATIONS = {
   "6s":  { label: "6 сек (1 кред)",  duration: "6s",  credits: "1 кред/видео" },
   "10s": { label: "10 сек (3 кред)", duration: "10s", credits: "3 кред/видео" },
@@ -370,18 +382,18 @@ function getFailedTask(chatId, errKey) {
   return failedTasks.get(`${chatId}_${errKey}`);
 }
 
-// ─── ИСПРАВЛЕНИЕ 1: получение реального состояния лимитов из API ──
+// ─── Получение реального состояния лимитов из API ──
 async function getRealVideoUsage() {
   try {
     const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
       headers: v5Headers(), timeout: 10000,
     });
     const lim = data.account_limits || {};
-    const usage = data.current_usage || {};
+    const usage = data.current_usage?.hourly_usage?.video_generation || {};
     return {
       hourLimit: lim.video_gen_per_hour_limit || 15,
-      usedThisHour: usage.video_gen_this_hour || 0,
-      resetAt: usage.video_hour_reset_at ? new Date(usage.video_hour_reset_at).getTime() : null,
+      usedThisHour: usage.current_usage || 0,
+      windowStart: usage.window_start || null,
     };
   } catch(e) {
     console.log(`[getRealVideoUsage] failed: ${e.message}`);
@@ -770,22 +782,7 @@ async function runPromptGen(chatId, storyText) {
   showBatchMenu(chatId);
 }
 
-// ─── /start /menu ─────────────────────────
-bot.onText(/\/start|\/menu/, async (msg) => {
-  const chatId = msg.chat.id;
-  const s = getState(chatId);
-  if (s.menuMsgId) {
-    await bot.deleteMessage(chatId, s.menuMsgId).catch(() => {});
-    s.menuMsgId = null;
-  }
-  showMainMenu(chatId);
-});
-
-bot.onText(/\/check (.+)/, async (msg, match) => {
-  await checkGeneration(msg.chat.id, match[1].trim());
-});
-
-// ─── ИСПРАВЛЕНИЕ 1+2: Почасовой планировщик видео с реальным лимитом API ─────────
+// ─── Почасовой планировщик видео ─────────
 const videoScheduler = {};
 
 async function scheduleVideoChunk(chatId) {
@@ -807,29 +804,21 @@ async function scheduleVideoChunk(chatId) {
   const { model, batchS, hourlyLimit } = job;
   const total = job.totalTasks;
 
-  // ИСПРАВЛЕНИЕ 1: Спрашиваем у API сколько видео уже отправлено в этом часу
-  // и сколько ещё можно отправить, чтобы не превысить лимит
   let allowedThisChunk = hourlyLimit;
   let waitMs = 0;
   let resetTime = "";
 
   const realUsage = await getRealVideoUsage();
   if (realUsage) {
-    const apiLimit = Math.min(hourlyLimit, realUsage.hourLimit); // берём меньший из двух лимитов
+    const apiLimit = Math.min(hourlyLimit, realUsage.hourLimit);
     const usedAlready = realUsage.usedThisHour || 0;
     const remaining = Math.max(0, apiLimit - usedAlready);
 
     console.log(`[scheduler] API usage: used=${usedAlready}/${apiLimit}, remaining=${remaining}`);
 
     if (remaining === 0) {
-      // Лимит исчерпан — ждём реального сброса от API
-      if (realUsage.resetAt && realUsage.resetAt > Date.now()) {
-        waitMs = realUsage.resetAt - Date.now() + 5000; // +5сек запас
-      } else {
-        // API не вернул resetAt — ждём до следующего часа по локальному времени
-        waitMs = Math.max(60000, nextHourReset() - Date.now() + 5000);
-      }
-      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+      waitMs = getTimeUntilNextHourUTC() + 5000;
+      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
       await bot.sendMessage(chatId,
         `⏳ Лимит API исчерпан (использовано ${usedAlready}/${apiLimit}).\n` +
         `🕐 Следующая пачка в *${resetTime}* UTC.\nМожно закрыть приложение — бот продолжит.`,
@@ -839,13 +828,12 @@ async function scheduleVideoChunk(chatId) {
     }
     allowedThisChunk = remaining;
   } else {
-    // Не удалось получить данные из API — используем локальный счётчик как раньше
     checkResetBalance();
     const usedLocal = balanceState.videos || 0;
     const remaining = Math.max(0, hourlyLimit - usedLocal);
     if (remaining === 0) {
-      waitMs = Math.max(60000, balanceState.resetAt - Date.now() + 5000);
-      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+      waitMs = getTimeUntilNextHourUTC() + 5000;
+      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
       await bot.sendMessage(chatId,
         `⏳ Локальный лимит исчерпан.\n🕐 Следующая пачка в *${resetTime}* UTC.\nМожно закрыть приложение — бот продолжит.`,
         { parse_mode: "Markdown" });
@@ -871,10 +859,34 @@ async function scheduleVideoChunk(chatId) {
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
   }
 
-  // Запускаем задачи строго последовательно одну за одной,
-  // чтобы точно не превысить лимит: следующая стартует только после завершения предыдущей
   for (const task of chunk) {
     if (job.stopped) break;
+
+    // Проверяем: до следующего часа UTC осталось меньше 5 минут?
+    const timeUntilNextHour = getTimeUntilNextHourUTC();
+    if (timeUntilNextHour < 5 * 60 * 1000) {
+      // Не перегенерируем — сохраняем задачу
+      const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      storeFailedTask(chatId, errKey, {
+        prompt: task.prompt,
+        operation: task.operation,
+        model: task.model,
+        isImage: false,
+        ratio: batchS.ratio,
+        resolution: batchS.resolution,
+        grokDuration: batchS.grokDuration,
+        imageRef: task.imageRef,
+        seed: batchS.seed,
+      });
+      await bot.sendMessage(chatId,
+        `⚠️ Осталось <5 минут до конца часа. Задача ${task.idx} отложена для ручной перегенерации.`,
+        { parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+        });
+      job.errorsSoFar++;
+      continue;
+    }
+
     try {
       await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
       job.doneSoFar++;
@@ -890,14 +902,8 @@ async function scheduleVideoChunk(chatId) {
   }
 
   if (job.tasks.length > 0) {
-    // После завершения пачки снова спрашиваем API когда сбросится лимит
-    const usageAfter = await getRealVideoUsage();
-    if (usageAfter && usageAfter.resetAt && usageAfter.resetAt > Date.now()) {
-      waitMs = usageAfter.resetAt - Date.now() + 5000;
-    } else {
-      waitMs = Math.max(60000, nextHourReset() - Date.now() + 5000);
-    }
-    resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+    waitMs = getTimeUntilNextHourUTC() + 5000;
+    resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
     await bot.sendMessage(chatId,
       `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
       `Осталось *${job.tasks.length}* задач.\n` +
@@ -915,10 +921,11 @@ async function scheduleVideoChunk(chatId) {
   }
 }
 
-// ─── Генерация одной задачи (v5) ──────────
+// ─── Генерация одной задачи (v5) с автоперегенерацией до 5 раз ──────────
 async function genOne(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null, isScheduled = false) {
   const label = batchIdx || (total > 1 ? `${index}/${total}` : "");
   const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const MAX_RETRIES = 5;
 
   const body = {
     operation,
@@ -946,77 +953,122 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     seed: s.seed,
   };
 
-  let genId;
-  try {
-    const created = await v5Create(body);
-    genId = created.id;
-    if (!genId) throw new Error(`v5Create returned no id: ${JSON.stringify(created).slice(0, 200)}`);
-  } catch(e) {
-    const detail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
-    const status = e.response?.status ? `[HTTP ${e.response.status}] ` : "";
-    const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
-    console.error(`[genOne] create failed: ${status}${errStr}`);
-    addHistory(chatId, { model: model.label, prompt, genId: "error", operation, isImage, ratio: s.ratio });
+  let lastError = null;
+  let lastRefunded = false;
 
-    storeFailedTask(chatId, errKey, taskData);
-    await bot.sendMessage(chatId,
-      `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
-      `🤖 ${model.label}\n` +
-      `${status}${errStr.slice(0, 400)}`,
-      {
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+  for (let retry = 0; retry < MAX_RETRIES; retry++) {
+    let genId;
+    try {
+      const created = await v5Create(body);
+      genId = created.id;
+      if (!genId) throw new Error(`v5Create returned no id: ${JSON.stringify(created).slice(0, 200)}`);
+    } catch(e) {
+      const detail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
+      const status = e.response?.status ? `[HTTP ${e.response.status}] ` : "";
+      const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
+      console.error(`[genOne] create failed (retry ${retry + 1}/${MAX_RETRIES}): ${status}${errStr}`);
+
+      lastError = new Error(`${status}${errStr}`);
+      lastRefunded = false;
+
+      // Если до следующего часа UTC осталось меньше 5 минут — прекращаем перегенерацию
+      if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
+        storeFailedTask(chatId, errKey, taskData);
+        await bot.sendMessage(chatId,
+          `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry} попыток.\n` +
+          `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
+          `🤖 ${model.label}\n${status}${errStr.slice(0, 400)}`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+          });
+        throw lastError;
       }
-    );
-    throw e;
-  }
 
-  addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio });
-
-  let results;
-  try {
-    results = await v5Poll(genId);
-  } catch(e) {
-    console.error(`[genOne] poll failed genId=${genId}: ${e.message}`);
-
-    storeFailedTask(chatId, errKey, taskData);
-    await bot.sendMessage(chatId,
-      `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${e.message.slice(0, 400)}`,
-      {
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-      }
-    );
-    throw e;
-  }
-
-  if (isImage) spendBalance("images", 1);
-  else {
-    const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
-    spendBalance("videos", vidCost);
-  }
-
-  const idxStr = batchIdx ? `*${batchIdx}* ` : "";
-  const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
-  const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
-
-  try {
-    for (const item of results) {
-      let media;
-      if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
-      else if (item.download_path) {
-        const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
-        media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
-      }
-      if (media) await sendV5Media(chatId, media, caption, regenKb);
+      // Иначе продолжаем retry
+      continue;
     }
-  } catch(e) {
-    console.error(`[genOne] sendMedia failed genId=${genId}: ${e.message}`);
-    await bot.sendMessage(chatId,
-      `⚠️ Генерация завершена, но отправка файла не удалась\n${e.message.slice(0, 300)}`,
-      { parse_mode: "Markdown" }
-    );
+
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio });
+
+    let results;
+    try {
+      const pollResult = await v5Poll(genId);
+      results = pollResult.results;
+      const usage = pollResult.usage;
+
+      // Успех! Тратим баланс (только если refunded=false или нет данных)
+      if (!usage || usage.refunded !== true) {
+        if (isImage) spendBalance("images", 1);
+        else {
+          const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
+          spendBalance("videos", vidCost);
+        }
+      }
+
+      const idxStr = batchIdx ? `*${batchIdx}* ` : "";
+      const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
+      const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
+
+      try {
+        for (const item of results) {
+          let media;
+          if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
+          else if (item.download_path) {
+            const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
+            media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
+          }
+          if (media) await sendV5Media(chatId, media, caption, regenKb);
+        }
+      } catch(e) {
+        console.error(`[genOne] sendMedia failed genId=${genId}: ${e.message}`);
+        await bot.sendMessage(chatId,
+          `⚠️ Генерация завершена, но отправка файла не удалась\n${e.message.slice(0, 300)}`,
+          { parse_mode: "Markdown" }
+        );
+      }
+
+      return; // Успешное завершение
+    } catch(e) {
+      console.error(`[genOne] poll failed genId=${genId} (retry ${retry + 1}/${MAX_RETRIES}): ${e.message}`);
+
+      // Парсим refunded из ошибки
+      const errMsg = e.message || "";
+      const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
+      lastRefunded = refundedMatch ? refundedMatch[1] === "true" : false;
+      lastError = new Error(errMsg.replace(/\|REFUNDED:(true|false)/, ""));
+
+      // Если до следующего часа UTC осталось меньше 5 минут — прекращаем перегенерацию
+      if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
+        storeFailedTask(chatId, errKey, taskData);
+        await bot.sendMessage(chatId,
+          `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry + 1} попыток.\n` +
+          `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${lastError.message.slice(0, 400)}\n` +
+          `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+          });
+        throw lastError;
+      }
+
+      // Иначе продолжаем retry
+      continue;
+    }
   }
+
+  // Все 5 попыток исчерпаны
+  storeFailedTask(chatId, errKey, taskData);
+  await bot.sendMessage(chatId,
+    `❌ *Ошибка после ${MAX_RETRIES} попыток перегенерации*${label ? ` [${label}]` : ""}\n` +
+    `🤖 ${model.label}\n` +
+    `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
+    `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+    });
+  throw lastError || new Error("Max retries exceeded");
 }
 
 // ─── Перегенерация задачи с ошибкой ──
@@ -1167,10 +1219,15 @@ async function runKeyframes(chatId, s, prompt) {
         ...(s.seed === "fixed" && { seed: 42 }),
       };
       const created = await v5Create(body);
-      const results = await v5Poll(created.id);
-      spendBalance("videos", 1);
+      const pollResult = await v5Poll(created.id);
+
+      // Проверяем refunded
+      if (!pollResult.usage || pollResult.usage.refunded !== true) {
+        spendBalance("videos", 1);
+      }
+
       await bot.editMessageText("✅ Готово!", { chat_id: chatId, message_id: statusMsg.message_id });
-      for (const item of results) {
+      for (const item of pollResult.results) {
         if (item.data || item.download_path) {
           const url = item.data ? null : `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
           const media = item.data
@@ -1180,7 +1237,8 @@ async function runKeyframes(chatId, s, prompt) {
         }
       }
     } catch(e) {
-      await bot.editMessageText(`❌ ${e.message.slice(0, 300)}`, { chat_id: chatId, message_id: statusMsg.message_id });
+      const errMsg = e.message?.replace(/\|REFUNDED:(true|false)/, "") || "Неизвестная ошибка";
+      await bot.editMessageText(`❌ ${errMsg.slice(0, 300)}`, { chat_id: chatId, message_id: statusMsg.message_id });
     }
     showMainMenu(chatId);
   };
@@ -1228,23 +1286,22 @@ async function runBatch(chatId) {
       const prompt = prompts[fi] || prompts[0] || "animate";
       const op = model.opImg || model.opText;
       for (let vi = 0; vi < perPrompt; vi++)
-        tasks.push({ prompt, idx: `ф${fi + 1}.${vi + 1}`, operation: op, imageRef: photoRefs[fi] });
+        tasks.push({ prompt, idx: `ф${fi + 1}.${vi + 1}`, operation: op, imageRef: photoRefs[fi], model });
     }
     for (let pi = photos.length; pi < prompts.length; pi++)
       for (let vi = 0; vi < perPrompt; vi++)
-        tasks.push({ prompt: prompts[pi], idx: `т${pi + 1}.${vi + 1}`, operation: model.opText, imageRef: null });
+        tasks.push({ prompt: prompts[pi], idx: `т${pi + 1}.${vi + 1}`, operation: model.opText, imageRef: null, model });
   } else {
     const op = isImage ? model.operation : model.opText;
     for (let pi = 0; pi < prompts.length; pi++)
       for (let vi = 0; vi < perPrompt; vi++)
-        tasks.push({ prompt: prompts[pi], idx: `${pi + 1}.${vi + 1}`, operation: op, imageRef: null });
+        tasks.push({ prompt: prompts[pi], idx: `${pi + 1}.${vi + 1}`, operation: op, imageRef: null, model });
   }
 
   const total = tasks.length;
   const hourlyLimit = s.batchHourlyLimit || 15;
 
   if (!isImage && total > hourlyLimit) {
-    // Почасовой режим для видео
     videoScheduler[chatId] = {
       tasks: [...tasks],
       totalTasks: total,
@@ -1267,7 +1324,6 @@ async function runBatch(chatId) {
     return;
   }
 
-  // Обычный пакет (изображения или видео не превышающее лимит)
   const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
@@ -1275,7 +1331,7 @@ async function runBatch(chatId) {
     { parse_mode: "Markdown" });
 
   const allTasks = tasks.map(task =>
-    queue(() => genOne(chatId, batchS, task.prompt, task.operation, model, isImage, 0, 0, task.idx, task.imageRef || null, true))
+    queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
       .then(() => done++)
       .catch(() => errors++)
       .finally(() => {
@@ -1304,11 +1360,16 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
   try {
     const body = { operation, prompt: item.prompt, aspect_ratio: item.ratio || s.ratio, ...(s.seed === "fixed" && { seed: 42 }) };
     const created = await v5Create(body);
-    const results = await v5Poll(created.id);
-    if (isImage) spendBalance("images", 1); else spendBalance("videos", 1);
+    const pollResult = await v5Poll(created.id);
+
+    // Проверяем refunded
+    if (!pollResult.usage || pollResult.usage.refunded !== true) {
+      if (isImage) spendBalance("images", 1); else spendBalance("videos", 1);
+    }
+
     addHistory(chatId, { model: model.label, prompt: item.prompt, genId: created.id, operation, isImage, ratio: item.ratio || s.ratio });
     await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id });
-    for (const res of results) {
+    for (const res of pollResult.results) {
       if (res.data || res.download_path) {
         const url = res.data ? null : `${STORAGE_URL}${res.download_path.startsWith("/") ? "" : "/"}${res.download_path}`;
         const media = res.data ? { type: "data_uri", value: res.data, mediaType: res.type } : { type: "url", value: url, mediaType: res.type };
@@ -1317,7 +1378,7 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
       }
     }
   } catch(e) {
-    const detail = e.response?.data?.detail || e.message;
+    const detail = e.response?.data?.detail || e.message?.replace(/\|REFUNDED:(true|false)/, "") || e.message;
     await bot.editMessageText(`❌ ${String(detail).slice(0, 300)}`, { chat_id: chatId, message_id: statusMsg.message_id });
   }
   showMainMenu(chatId);
@@ -1371,7 +1432,6 @@ bot.on("callback_query", async (query) => {
   if (data === "open_misc")     { s.menuMsgId = msgId; return showMiscMenu(chatId, msgId); }
   if (data === "show_history")  { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId, 0); }
 
-  // Перегенерация ошибочных задач
   if (data.startsWith("retry_err_")) {
     const errKey = data.replace("retry_err_", "");
     return retryFailedTask(chatId, errKey);
@@ -1578,7 +1638,6 @@ bot.on("callback_query", async (query) => {
   }
   if (data.startsWith("set_res_")) { s.resolution = data.replace("set_res_", ""); saveState(chatId); return showMiscMenu(chatId, msgId); }
 
-  // Длительность Grok видео
   if (data === "open_grok_duration") return showGrokDurationMenu(chatId, msgId);
   if (data === "set_grok_dur_6s")  { s.grokDuration = "6s";  saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
   if (data === "set_grok_dur_10s") { s.grokDuration = "10s"; saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
@@ -1622,17 +1681,15 @@ bot.on("callback_query", async (query) => {
     return genFn(rawPrompt);
   }
 
-  // ── ИСПРАВЛЕНИЕ 3: Отмена всех задач — останавливает scheduler и шлёт cancel-all в API
+  // ── Отмена всех задач
   if (data === "cancel_all_ops") {
     await bot.answerCallbackQuery(query.id, { text: "⏳ Отменяю..." });
 
-    // Останавливаем почасовой scheduler если он запущен
     if (videoScheduler[chatId]) {
       videoScheduler[chatId].stopped = true;
       await bot.sendMessage(chatId, "🛑 Почасовой пакет остановлен.");
     }
 
-    // Сбрасываем все pending состояния
     const s2 = getState(chatId);
     s2.step = null;
     if (s2.pendingGenKey) {
@@ -1889,6 +1946,21 @@ bot.on("message", async (msg) => {
 
   if (s.mode === "keyframes") return runKeyframes(chatId, s, prompt);
   await runNormal(chatId, s, prompt);
+});
+
+// ─── /start /menu ─────────────────────────
+bot.onText(/\/start|\/menu/, async (msg) => {
+  const chatId = msg.chat.id;
+  const s = getState(chatId);
+  if (s.menuMsgId) {
+    await bot.deleteMessage(chatId, s.menuMsgId).catch(() => {});
+    s.menuMsgId = null;
+  }
+  showMainMenu(chatId);
+});
+
+bot.onText(/\/check (.+)/, async (msg, match) => {
+  await checkGeneration(msg.chat.id, match[1].trim());
 });
 
 console.log("🤖 FastGen Bot v5 запущен!");
