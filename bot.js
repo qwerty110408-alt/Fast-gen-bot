@@ -57,7 +57,7 @@ async function uploadToStorage(buffer, filename = "image.jpg") {
   return `file:${data.file_hash}`;
 }
 
-// ─── Загрузить фото из Telegram → base64 data URI (для inputs v5) ──
+// ─── Загрузить фото из Telegram → base64 data URI ──
 async function tgPhotoToDataUri(fileId) {
   const f = await bot.getFile(fileId);
   const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
@@ -66,7 +66,7 @@ async function tgPhotoToDataUri(fileId) {
   return `data:${mime};base64,${Buffer.from(resp.data).toString("base64")}`;
 }
 
-// ─── Загрузить фото из Telegram → storage ref (для batch) ──
+// ─── Загрузить фото из Telegram → storage ref ──
 async function tgPhotoToRef(fileId) {
   const f = await bot.getFile(fileId);
   const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
@@ -83,7 +83,7 @@ async function v5Create(body) {
   const { data } = await axios.post(`${BASE_URL}/api/v5/generations`, body, {
     headers: v5Headers(), timeout: 120000,
   });
-  return data; // { id, status:"queued", operation, provider, model, media_type, ... }
+  return data;
 }
 
 async function v5Poll(genId, maxAttempts = 90, interval = 10000) {
@@ -110,19 +110,6 @@ async function v5Poll(genId, maxAttempts = 90, interval = 10000) {
   throw new Error("Generation timed out after polling");
 }
 
-// Из results[] достаём медиа: download_path → URL или data URI
-async function extractV5Media(results) {
-  if (!results || results.length === 0) throw new Error("No results returned");
-  const item = results[0];
-  if (item.data) return { type: "data_uri", value: item.data, mediaType: item.type };
-  if (item.download_path) {
-    // download_path это путь, собираем полный URL через storage
-    const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
-    return { type: "url", value: url, mediaType: item.type };
-  }
-  throw new Error(`Result has no data or download_path: ${JSON.stringify(item)}`);
-}
-
 async function sendV5Media(chatId, media, caption, replyMarkup = null) {
   const isImage = media.mediaType === "image";
   const opts = { caption, parse_mode: "Markdown", ...(replyMarkup && { reply_markup: replyMarkup }) };
@@ -133,7 +120,6 @@ async function sendV5Media(chatId, media, caption, replyMarkup = null) {
     return;
   }
 
-  // data_uri — сохраняем во временный файл
   let b64 = media.value;
   let ext = isImage ? "jpg" : "mp4";
   if (b64.includes(";base64,")) {
@@ -174,11 +160,8 @@ User prompt: ${rawPrompt}`;
 // ─── Баланс ───────────────────────────────
 const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
 
-// Сброс лимита происходит каждый час по UTC (14:00, 15:00, 16:00...)
-// Считаем миллисекунды до следующей круглой UTC-минуты xx:00:00.000
 function nextHourReset() {
   const now = Date.now();
-  // Следующий UTC-час: округляем вверх до начала следующего часа
   const msPerHour = 60 * 60 * 1000;
   return Math.ceil((now + 1) / msPerHour) * msPerHour;
 }
@@ -238,7 +221,8 @@ async function formatBalance() {
     `\n*Стоимость моделей:*\n` +
     `🖼 Imagen 4 / NanoPro / NanoBanana 2 (Flow): 4 кред\n` +
     `🖼 NanaBanana 2 (Flower) / ChatGPT / Grok: 1 кред\n` +
-    `🎬 Veo 3.1 Fast/Light/Ultra-Light/Flower/Grok: 1 кред\n` +
+    `🎬 Veo 3.1 Fast/Light/Ultra-Light/Flower/Grok 6s: 1 кред\n` +
+    `🎬 Grok Video 10s: 3 кред\n` +
     `🎬 Omni Flash 4-8s: 1 кред | 10s: 2 кред\n` +
     `🎬 Veo 3.1 Quality: 10 кред ⚠️\n` +
     `\nОбновлено: ${new Date().toLocaleTimeString("ru")}`
@@ -246,8 +230,6 @@ async function formatBalance() {
 }
 
 // ─── Модели ───────────────────────────────
-// operation — это то что идёт в v5 generations body
-// для видео: operation меняется в зависимости от режима (text/image/keyframes)
 const IMAGE_MODELS = {
   "imagen4":    { label: "Imagen 4",           operation: "imagen_4_image_generate",         credits: "4 кред/фото" },
   "nanopro":    { label: "NanoBanana Pro",      operation: "nano_banana_pro_image_generate",  credits: "4 кред/фото" },
@@ -258,13 +240,24 @@ const IMAGE_MODELS = {
   "chatgpt":    { label: "ChatGPT Images",      operation: "openai_image_generate",           credits: "1 кред/фото" },
 };
 
+// ─── GROK VIDEO DURATION ──────────────────
+// Длительность Grok видео влияет на стоимость: 6s = 1 кред, 10s = 3 кред
+const GROK_DURATIONS = {
+  "6s":  { label: "6 сек (1 кред)",  duration: "6s",  credits: "1 кред/видео" },
+  "10s": { label: "10 сек (3 кред)", duration: "10s", credits: "3 кред/видео" },
+};
+
+function getGrokVideoCredits(duration) {
+  return duration === "10s" ? 3 : 1;
+}
+
 const VIDEO_MODELS = {
   "veo_fast":   { label: "Veo 3.1 Fast",        opText: "flow_video_from_text",         opImg: "flow_video_from_ingredients",         opKf: "flow_video_from_keyframes",         credits: "1 кред/видео" },
   "veo_light":  { label: "Veo 3.1 Light",       opText: "flow_video_light_from_text",   opImg: "flow_video_light_from_ingredients",   opKf: "flow_video_light_from_keyframes",   credits: "1 кред/видео" },
   "veo_ultra":  { label: "Veo 3.1 Ultra-Light", opText: "flow_video_ultra_light_from_text", opImg: "flow_video_ultra_light_from_ingredients", opKf: "flow_video_ultra_light_from_keyframes", credits: "1 кред/видео" },
   "veo_qual":   { label: "Veo 3.1 Quality",     opText: "flow_video_quality_from_text", opImg: null,                                  opKf: "flow_video_quality_from_keyframes", credits: "10 кред/видео ⚠️" },
   "flower_vid": { label: "Veo 3.1 Flower",      opText: "flower_video_from_text",       opImg: "flower_video_from_image",             opKf: null,                                credits: "1 кред/видео" },
-  "grok_vid":   { label: "Grok Video",          opText: "grok_video_from_text",         opImg: "grok_video_from_image",               opKf: null,                                credits: "1-3 кред/видео", hasResolution: true },
+  "grok_vid":   { label: "Grok Video",          opText: "grok_video_from_text",         opImg: "grok_video_from_image",               opKf: null,                                credits: "1/3 кред/видео", hasResolution: true, hasDuration: true },
   "omni_4s":    { label: "Omni Flash 4s",       opText: "flow_video_omni_flash_from_text_4s",  opImg: "flow_video_omni_flash_from_ingredients_4s",  opKf: null, credits: "1 кред/видео" },
   "omni_6s":    { label: "Omni Flash 6s",       opText: "flow_video_omni_flash_from_text_6s",  opImg: "flow_video_omni_flash_from_ingredients_6s",  opKf: null, credits: "1 кред/видео" },
   "omni_8s":    { label: "Omni Flash 8s",       opText: "flow_video_omni_flash_from_text_8s",  opImg: "flow_video_omni_flash_from_ingredients_8s",  opKf: null, credits: "1 кред/видео" },
@@ -283,6 +276,7 @@ const DEFAULT_STATE = () => ({
   perPrompt: 1,
   seed: "random",
   resolution: "720p",
+  grokDuration: "6s",       // НОВОЕ: длительность Grok видео
   batchType: "image",
   batchPrompts: [],
   batchPhotos: [],
@@ -291,6 +285,7 @@ const DEFAULT_STATE = () => ({
   batchVidModel: null,
   batchRatio: null,
   batchResolution: null,
+  batchGrokDuration: null,  // НОВОЕ: длительность Grok в пакете
   batchHourlyLimit: 15,
   keyframeStart: null,
   keyframeEnd: null,
@@ -331,9 +326,11 @@ function saveState(chatId) {
   persistedStates[key] = {
     imgModel: s.imgModel, vidModel: s.vidModel, ratio: s.ratio,
     count: s.count, perPrompt: s.perPrompt, seed: s.seed,
-    resolution: s.resolution, batchType: s.batchType,
+    resolution: s.resolution, grokDuration: s.grokDuration,
+    batchType: s.batchType,
     batchImgModel: s.batchImgModel, batchVidModel: s.batchVidModel,
     batchRatio: s.batchRatio, batchResolution: s.batchResolution,
+    batchGrokDuration: s.batchGrokDuration,
     batchHourlyLimit: s.batchHourlyLimit,
     pgSplitMode: s.pgSplitMode, pgParallel: s.pgParallel,
     pgProvider: s.pgProvider, pgApiKey: s.pgApiKey, pgTemplate: s.pgTemplate,
@@ -358,8 +355,22 @@ function addHistory(chatId, entry) {
   saveJSON(HISTORY_FILE, persistedHistory);
 }
 
-// ─── Pending generators (для enhance ask) ─
+// ─── Pending generators ────────────────────
 const pendingGenerators = new Map();
+
+// ─── НОВОЕ: хранилище задач с ошибками для перегенерации ──
+// Ключ: "chatId_errKey" → { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef }
+const failedTasks = new Map();
+
+function storeFailedTask(chatId, errKey, taskData) {
+  failedTasks.set(`${chatId}_${errKey}`, taskData);
+  // Удаляем через 24 часа чтобы не накапливалось
+  setTimeout(() => failedTasks.delete(`${chatId}_${errKey}`), 24 * 60 * 60 * 1000);
+}
+
+function getFailedTask(chatId, errKey) {
+  return failedTasks.get(`${chatId}_${errKey}`);
+}
 
 // ─── Баланс UI ────────────────────────────
 async function showBalance(chatId, msgId = null) {
@@ -417,11 +428,12 @@ async function showMainMenu(chatId) {
   const im = IMAGE_MODELS[s.imgModel];
   const vm = VIDEO_MODELS[s.vidModel];
   const enhLabel = { always: "✨ Всегда", never: "⏭ Никогда", ask: "❓ Спрашивать" }[s.enhanceMode];
+  const grokDurLabel = s.vidModel === "grok_vid" ? ` | ⏱ ${s.grokDuration || "6s"}` : "";
   const text =
     `🤖 *FastGen Bot v5*\n\n` +
     `🖼 Фото: *${im.label}* — ${im.credits}\n` +
     `🎬 Видео: *${vm.label}* — ${vm.credits}\n` +
-    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed === "fixed" ? "Фикс. seed" : "Случ. seed"}\n` +
+    `📐 ${s.ratio} | 🔢 ${s.count} шт. | 🌱 ${s.seed === "fixed" ? "Фикс. seed" : "Случ. seed"}${grokDurLabel}\n` +
     `✨ Промпт: *${enhLabel}*`;
   const kb = { inline_keyboard: [
     [{ text: "🖼 Изображение", callback_data: "do_image" }, { text: "🖼📸 Из референсов", callback_data: "do_image_ref" }],
@@ -451,10 +463,25 @@ function showMiscMenu(chatId, msgId = null) {
     [{ text: "🎞 Ключ. кадры", callback_data: "do_keyframes" }],
     [{ text: seedLabel, callback_data: "open_seed" }],
     ...(VIDEO_MODELS[s.vidModel]?.hasResolution ? [[{ text: `🖥 Разрешение Grok: ${s.resolution}`, callback_data: "open_resolution" }]] : []),
+    ...(VIDEO_MODELS[s.vidModel]?.hasDuration ? [[{ text: `⏱ Длительность Grok: ${s.grokDuration || "6s"}`, callback_data: "open_grok_duration" }]] : []),
     [{ text: `✨ Промпт: ${enhLabel}`, callback_data: "open_enhance" }],
     [{ text: "🧠 Генерация промптов", callback_data: "open_promptgen" }],
     [{ text: "📋 История", callback_data: "show_history" }],
     [{ text: "◀️ Назад", callback_data: "back_menu" }],
+  ]};
+  if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(() => {});
+  else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+// ─── НОВОЕ: Меню длительности Grok ──────
+function showGrokDurationMenu(chatId, msgId = null) {
+  const s = getState(chatId);
+  const cur = s.grokDuration || "6s";
+  const text = `⏱ *Длительность Grok Video*\n\n6 сек = 1 кред\n10 сек = 3 кред`;
+  const kb = { inline_keyboard: [
+    [{ text: cur === "6s" ? "✅ 6 сек (1 кред)" : "6 сек (1 кред)", callback_data: "set_grok_dur_6s" },
+     { text: cur === "10s" ? "✅ 10 сек (3 кред)" : "10 сек (3 кред)", callback_data: "set_grok_dur_10s" }],
+    [{ text: "◀️ Назад", callback_data: "open_misc" }],
   ]};
   if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(() => {});
   else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
@@ -469,18 +496,19 @@ function batchEffective(s) {
   const model = isImage ? IMAGE_MODELS[imgModelKey] : VIDEO_MODELS[vidModelKey];
   const ratio = s.batchRatio || s.ratio;
   const resolution = s.batchResolution || s.resolution || "720p";
-  return { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution };
+  const grokDuration = s.batchGrokDuration || s.grokDuration || "6s";
+  return { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution, grokDuration };
 }
 
 function showBatchSettingsMenu(chatId, msgId = null) {
   const s = getState(chatId);
-  const { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution } = batchEffective(s);
+  const { bt, isImage, imgModelKey, vidModelKey, model, ratio, resolution, grokDuration } = batchEffective(s);
   const isGrok = vidModelKey === "grok_vid";
   const text =
     `⚙️ *Настройки пакета*\n\n` +
     `Модель: *${model.label}*\n` +
     `Соотношение: *${ratio}*\n` +
-    (!isImage && isGrok ? `Разрешение: *${resolution}*\n` : "");
+    (!isImage && isGrok ? `Разрешение: *${resolution}*\nДлительность: *${grokDuration}*\n` : "");
 
   const modelRows = isImage
     ? Object.entries(IMAGE_MODELS).map(([k, v]) => [{ text: `${imgModelKey === k ? "✅ " : ""}${v.label}`, callback_data: `bset_im_${k}` }])
@@ -488,11 +516,14 @@ function showBatchSettingsMenu(chatId, msgId = null) {
 
   const ratioRows = [RATIOS.map(r => ({ text: `${ratio === r ? "✅ " : ""}${r}`, callback_data: `bset_ratio_${r.replace(":", "x")}` }))];
   const resRow = !isImage && isGrok ? [[["480p", "720p"].map(r => ({ text: `${resolution === r ? "✅ " : ""}${r}`, callback_data: `bset_res_${r}` }))]] : [];
+  // НОВОЕ: строка длительности Grok в настройках пакета
+  const durRow = !isImage && isGrok ? [[["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с(1кр)" : "10с(3кр)"}`, callback_data: `bset_dur_${d}` }))]] : [];
 
   const kb = { inline_keyboard: [
     ...modelRows,
     ...ratioRows,
     ...(resRow.length ? resRow[0].map(r => [r]) : []),
+    ...(durRow.length ? durRow[0].map(d => [d]) : []),
     [{ text: "🔄 Сбросить (= главное меню)", callback_data: "bset_reset" }],
     [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
   ]};
@@ -524,7 +555,7 @@ function showBatchTypeMenu(chatId, msgId = null) {
 
 function showBatchMenu(chatId, msgId = null) {
   const s = getState(chatId);
-  const { bt, isImage, model, ratio, resolution, vidModelKey } = batchEffective(s);
+  const { bt, isImage, model, ratio, resolution, grokDuration, vidModelKey } = batchEffective(s);
   const isVideoImage = bt === "video_image";
   const isGrokVid = vidModelKey === "grok_vid";
   const MAX = isImage ? 500 : 200;
@@ -542,7 +573,7 @@ function showBatchMenu(chatId, msgId = null) {
     `📦 *Пакетный режим*\n\n` +
     `${typeIcon} Тип: *${isImage ? "Фото" : isVideoImage ? "Видео из фото" : "Видео из текста"}*\n` +
     `🤖 Модель: *${model.label}*\n` +
-    `📐 ${ratio}${!isImage && isGrokVid ? ` | 🖥 ${resolution}` : ""}\n` +
+    `📐 ${ratio}${!isImage && isGrokVid ? ` | 🖥 ${resolution} | ⏱ ${grokDuration}` : ""}\n` +
     `📝 Промптов: *${prompts.length}/${MAX}*\n` +
     (isVideoImage ? `📸 Фото: *${photos.length}*\n` : "") +
     `🔢 На 1 промпт: *${s.perPrompt}*\n` +
@@ -643,7 +674,7 @@ function showRegenMenu(chatId, histIdx) {
   bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
 }
 
-// ─── callLLM (для pg провайдеров) ─────────
+// ─── callLLM ─────────────────────────────
 async function callLLM(provider, apiKey, template, userText) {
   const prompt = template.replace("{TEXT}", userText);
   if (provider === "fastgen") {
@@ -768,7 +799,8 @@ async function scheduleVideoChunk(chatId) {
   const chunkPromises = chunk.map(task =>
     videoQueue(async () => {
       try {
-        await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef);
+        // ИСПРАВЛЕНО: передаём isScheduled=true чтобы не показывать главное меню после каждой задачи
+        await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
         job.doneSoFar++;
       } catch {
         job.errorsSoFar++;
@@ -779,10 +811,9 @@ async function scheduleVideoChunk(chatId) {
   await Promise.allSettled(chunkPromises);
 
   if (job.tasks.length > 0) {
-    // Ждём до следующего UTC-часового сброса (например 14:00→15:00 UTC)
     checkResetBalance();
     const msLeft = Math.max(5000, balanceState.resetAt - Date.now());
-    const waitMs = msLeft + 3000; // +3 сек буфер после сброса
+    const waitMs = msLeft + 3000;
     const resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
     await bot.sendMessage(chatId,
       `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
@@ -802,8 +833,13 @@ async function scheduleVideoChunk(chatId) {
 }
 
 // ─── Генерация одной задачи (v5) ──────────
-async function genOne(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null) {
+// isScheduled=true → не показываем главное меню, не прерываем scheduler
+async function genOne(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null, isScheduled = false) {
   const label = batchIdx || (total > 1 ? `${index}/${total}` : "");
+
+  // НОВОЕ: уникальный ключ для хранения задачи при ошибке
+  const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
   const body = {
     operation,
     prompt,
@@ -811,15 +847,26 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     ...(s.seed === "fixed" && { seed: 42 }),
     ...(model.quality && { quality: model.quality }),
     ...(model.hasResolution && { resolution: s.resolution || "720p" }),
+    // НОВОЕ: длительность для Grok видео
+    ...(model.hasDuration && s.grokDuration && { duration: s.grokDuration }),
   };
 
-  // Добавляем изображения как inputs (storage refs)
   const refs = imageRef ? [imageRef] : (s.pendingRefImages && s.pendingRefImages.length > 0 ? s.pendingRefImages : null);
   if (refs && refs.length > 0) {
     body.inputs = refs;
   }
 
   console.log(`[genOne] operation=${operation} label=${label} bodyKeys=${Object.keys(body).join(",")}`);
+
+  // Данные задачи для сохранения на случай ошибки
+  const taskData = {
+    prompt, operation, model,
+    isImage, ratio: s.ratio,
+    resolution: s.resolution || "720p",
+    grokDuration: s.grokDuration || "6s",
+    imageRef: imageRef || null,
+    seed: s.seed,
+  };
 
   let genId;
   try {
@@ -832,11 +879,17 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
     console.error(`[genOne] create failed: ${status}${errStr}`);
     addHistory(chatId, { model: model.label, prompt, genId: "error", operation, isImage, ratio: s.ratio });
+
+    // НОВОЕ: сохраняем задачу и показываем кнопку перегенерации
+    storeFailedTask(chatId, errKey, taskData);
     await bot.sendMessage(chatId,
       `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
       `🤖 ${model.label}\n` +
       `${status}${errStr.slice(0, 400)}`,
-      { parse_mode: "Markdown" }
+      {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+      }
     );
     throw e;
   }
@@ -848,15 +901,25 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     results = await v5Poll(genId);
   } catch(e) {
     console.error(`[genOne] poll failed genId=${genId}: ${e.message}`);
+
+    // НОВОЕ: сохраняем задачу и показываем кнопку перегенерации
+    storeFailedTask(chatId, errKey, taskData);
     await bot.sendMessage(chatId,
       `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${e.message.slice(0, 400)}`,
-      { parse_mode: "Markdown" }
+      {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+      }
     );
     throw e;
   }
 
   if (isImage) spendBalance("images", 1);
-  else spendBalance("videos", 1);
+  else {
+    // НОВОЕ: учитываем стоимость Grok видео (1 или 3 кред)
+    const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
+    spendBalance("videos", vidCost);
+  }
 
   const idxStr = batchIdx ? `*${batchIdx}* ` : "";
   const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
@@ -878,6 +941,42 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
       `⚠️ Генерация завершена, но отправка файла не удалась\n${e.message.slice(0, 300)}`,
       { parse_mode: "Markdown" }
     );
+  }
+}
+
+// ─── НОВОЕ: Перегенерация задачи с ошибкой ──
+async function retryFailedTask(chatId, errKey) {
+  const task = getFailedTask(chatId, errKey);
+  if (!task) {
+    return bot.sendMessage(chatId, "❌ Задача не найдена (возможно устарела, прошло >24ч).");
+  }
+
+  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed } = task;
+
+  // Создаём временный s-объект с параметрами задачи
+  const fakeS = {
+    ratio,
+    resolution: resolution || "720p",
+    grokDuration: grokDuration || "6s",
+    seed: seed || "random",
+    pendingRefImages: [],
+  };
+
+  const statusMsg = await bot.sendMessage(chatId,
+    `🔄 *Перегенерирую задачу...*\n🤖 ${model.label}\n📝 _${prompt.slice(0, 80)}_`,
+    { parse_mode: "Markdown" }
+  );
+
+  try {
+    await genOne(chatId, fakeS, prompt, operation, model, isImage, 0, 0, null, imageRef, false);
+    await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
+    // Удаляем из хранилища после успешной перегенерации
+    failedTasks.delete(`${chatId}_${errKey}`);
+  } catch(e) {
+    await bot.editMessageText(
+      `❌ Снова ошибка: ${e.message.slice(0, 200)}`,
+      { chat_id: chatId, message_id: statusMsg.message_id }
+    ).catch(() => {});
   }
 }
 
@@ -982,7 +1081,6 @@ async function runKeyframes(chatId, s, prompt) {
     }
     const statusMsg = await bot.sendMessage(chatId, `⏳ Ключевые кадры...\n🎥 ${model.label}`);
     try {
-      // Загружаем кадры в storage
       const inputs = [];
       if (s.keyframeStart) inputs.push(await tgPhotoToDataUri(s.keyframeStart));
       if (s.keyframeEnd) inputs.push(await tgPhotoToDataUri(s.keyframeEnd));
@@ -1019,17 +1117,16 @@ async function runKeyframes(chatId, s, prompt) {
 // ─── runBatch ─────────────────────────────
 async function runBatch(chatId) {
   const s = getState(chatId);
-  const { bt, isImage, model, ratio, resolution, vidModelKey } = batchEffective(s);
+  const { bt, isImage, model, ratio, resolution, grokDuration, vidModelKey } = batchEffective(s);
   const isVideoImage = bt === "video_image";
-  const batchS = { ...s, ratio, resolution };
+  const batchS = { ...s, ratio, resolution, grokDuration };
   const prompts = [...s.batchPrompts];
-  const photos = [...s.batchPhotos]; // это fileId из Telegram
+  const photos = [...s.batchPhotos];
   const perPrompt = s.perPrompt || 1;
 
   if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
   if (isVideoImage && photos.length === 0) return bot.sendMessage(chatId, "❌ Добавь фото для режима «Видео из фото»!");
 
-  // Конвертируем фото в base64 data URI — по 5 параллельно чтобы не перегружать Telegram API
   let photoRefs = [];
   if (isVideoImage && photos.length > 0) {
     const uploadMsg = await bot.sendMessage(chatId, `⏳ Подготавливаю ${photos.length} фото...`);
@@ -1074,7 +1171,7 @@ async function runBatch(chatId) {
   const hourlyLimit = s.batchHourlyLimit || 15;
 
   if (!isImage && total > hourlyLimit) {
-    // Почасовой режим для видео
+    // Почасовой режим для видео — ИСПРАВЛЕНО: очищаем промпты только здесь
     videoScheduler[chatId] = {
       tasks: [...tasks],
       totalTasks: total,
@@ -1104,7 +1201,8 @@ async function runBatch(chatId) {
     { parse_mode: "Markdown" });
 
   const allTasks = tasks.map(task =>
-    queue(() => genOne(chatId, batchS, task.prompt, task.operation, model, isImage, 0, 0, task.idx, task.imageRef || null))
+    // ИСПРАВЛЕНО: передаём isScheduled=true чтобы genOne не вызывал showMainMenu внутри пакета
+    queue(() => genOne(chatId, batchS, task.prompt, task.operation, model, isImage, 0, 0, task.idx, task.imageRef || null, true))
       .then(() => done++)
       .catch(() => errors++)
       .finally(() => {
@@ -1199,6 +1297,12 @@ bot.on("callback_query", async (query) => {
   if (data === "refresh_balance") return showBalance(chatId, msgId);
   if (data === "open_misc")     { s.menuMsgId = msgId; return showMiscMenu(chatId, msgId); }
   if (data === "show_history")  { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId, 0); }
+
+  // НОВОЕ: обработчик перегенерации ошибочных задач
+  if (data.startsWith("retry_err_")) {
+    const errKey = data.replace("retry_err_", "");
+    return retryFailedTask(chatId, errKey);
+  }
 
   if (data.startsWith("hist_page_")) {
     return showHistoryMenu(chatId, msgId, parseInt(data.replace("hist_page_", "")));
@@ -1346,7 +1450,9 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("bset_vm_")) { s.batchVidModel = data.replace("bset_vm_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
   if (data.startsWith("bset_ratio_")) { s.batchRatio = data.replace("bset_ratio_", "").replace("x", ":"); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
   if (data.startsWith("bset_res_")) { s.batchResolution = data.replace("bset_res_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
-  if (data === "bset_reset") { s.batchImgModel = null; s.batchVidModel = null; s.batchRatio = null; s.batchResolution = null; saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
+  // НОВОЕ: длительность Grok в настройках пакета
+  if (data.startsWith("bset_dur_")) { s.batchGrokDuration = data.replace("bset_dur_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
+  if (data === "bset_reset") { s.batchImgModel = null; s.batchVidModel = null; s.batchRatio = null; s.batchResolution = null; s.batchGrokDuration = null; saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
 
   if (data === "bp_prev") { s.batchPromptIdx = Math.max(0, (s.batchPromptIdx || 0) - 1); return showBatchMenu(chatId, msgId); }
   if (data === "bp_next") { s.batchPromptIdx = Math.min(s.batchPrompts.length - 1, (s.batchPromptIdx || 0) + 1); return showBatchMenu(chatId, msgId); }
@@ -1395,10 +1501,15 @@ bot.on("callback_query", async (query) => {
   if (data === "open_resolution") {
     return edit("🖥 *Разрешение Grok Video:*", { inline_keyboard: [
       [["480p", "720p"].map(r => ({ text: (s.resolution || "720p") === r ? `✅ ${r}` : r, callback_data: `set_res_${r}` }))],
-      [{ text: "◀️ Назад", callback_data: "back_menu" }],
+      [{ text: "◀️ Назад", callback_data: "open_misc" }],
     ]});
   }
-  if (data.startsWith("set_res_")) { s.resolution = data.replace("set_res_", ""); saveState(chatId); del(); return showMainMenu(chatId); }
+  if (data.startsWith("set_res_")) { s.resolution = data.replace("set_res_", ""); saveState(chatId); return showMiscMenu(chatId, msgId); }
+
+  // НОВОЕ: длительность Grok видео
+  if (data === "open_grok_duration") return showGrokDurationMenu(chatId, msgId);
+  if (data === "set_grok_dur_6s")  { s.grokDuration = "6s";  saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
+  if (data === "set_grok_dur_10s") { s.grokDuration = "10s"; saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
 
   // ── Enhance
   if (data === "open_enhance") return showEnhanceMenu(chatId, msgId);
