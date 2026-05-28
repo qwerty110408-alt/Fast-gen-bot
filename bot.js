@@ -1097,6 +1097,72 @@ const REPLY_KEYBOARD = {
 bot.onText(/\/cost/, async (msg) => {
   const chatId = msg.chat.id;
 
+  const waitMsg = await bot.sendMessage(chatId, "⏳ Загружаю данные с API...");
+
+  // Живые запросы к API
+  let modelsText = "❌ Не удалось загрузить";
+  let capsText = "❌ Не удалось загрузить";
+  let providersText = "❌ Не удалось загрузить";
+  let chatModelsText = "❌ Не удалось загрузить";
+
+  try {
+    const { data: models } = await axios.get(`${BASE_URL}/api/v5/models`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+    });
+    if (Array.isArray(models) && models.length > 0) {
+      const imgModels = models.filter(m => m.media_type === "image");
+      const vidModels = models.filter(m => m.media_type === "video");
+      const txtModels = models.filter(m => m.media_type === "text");
+      const fmt = m => {
+        const cred = m.billing?.credits != null ? `${m.billing.credits} кред` : m.billing?.display || "токены";
+        const dep = m.deprecated ? " ⛔deprecated" : "";
+        const exp = m.experimental ? " 🧪exp" : "";
+        return `  • \`${m.id}\` — ${m.display_name}${dep}${exp} | ${cred}`;
+      };
+      modelsText =
+        (imgModels.length ? `🖼 *Изображения (${imgModels.length}):*\n${imgModels.map(fmt).join("\n")}` : "") +
+        (vidModels.length ? `\n\n🎬 *Видео (${vidModels.length}):*\n${vidModels.map(fmt).join("\n")}` : "") +
+        (txtModels.length ? `\n\n💬 *Текст (${txtModels.length}):*\n${txtModels.map(fmt).join("\n")}` : "");
+    }
+  } catch(e) { console.log("[/cost] models error:", e.message); }
+
+  try {
+    const { data: caps } = await axios.get(`${BASE_URL}/api/v5/capabilities`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+    });
+    if (Array.isArray(caps) && caps.length > 0) {
+      capsText = caps.map(c => {
+        const cred = c.billing?.credits != null ? `${c.billing.credits} кред` : c.billing?.display || "?";
+        const media = c.media_type === "image" ? "🖼" : c.media_type === "video" ? "🎬" : "💬";
+        return `${media} \`${c.id}\` — ${cred}`;
+      }).join("\n");
+    }
+  } catch(e) { console.log("[/cost] caps error:", e.message); }
+
+  try {
+    const { data: provs } = await axios.get(`${BASE_URL}/api/v5/providers`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+    });
+    if (Array.isArray(provs) && provs.length > 0) {
+      providersText = provs.map(p => {
+        const mlist = (p.models || []).map(m => `\`${m.id || m}\``).join(", ");
+        return `*${p.id || p.name}*: ${mlist || "—"}`;
+      }).join("\n");
+    }
+  } catch(e) { console.log("[/cost] providers error:", e.message); }
+
+  try {
+    const { data: chatMods } = await axios.get(`${BASE_URL}/v1/models`, {
+      headers: { "X-API-Key": FASTGEN_API_KEY }, timeout: 15000
+    });
+    const list = chatMods?.data || chatMods;
+    if (Array.isArray(list) && list.length > 0) {
+      chatModelsText = list.map(m => `  • \`${m.id}\` — ${m.name || m.owned_by || ""}`).join("\n");
+    }
+  } catch(e) { console.log("[/cost] chat models error:", e.message); }
+
+  await bot.deleteMessage(chatId, waitMsg.message_id).catch(()=>{});
+
   const parts = [];
 
   // Часть 1 — Изображения v4
@@ -1262,7 +1328,7 @@ Body: \`{"prompt":"..."}\`
 Query: \`?deep=true\` — полная проверка зависимостей`
   );
 
-  // Часть 4 — V5 + OpenAI-compatible
+  // Часть 4 — V5 эндпоинты
   parts.push(
 `🧪 *V5 — ЭКСПЕРИМЕНТАЛЬНЫЙ API*
 ⚠️ Финализируется, может измениться
@@ -1293,33 +1359,40 @@ Body: \`{"operation_ids":["id1"]}\`
 💳 Токенная (200k/час) | Body: \`{"prompt":"..."}\`
 
 ━━━━━━━━━━━━━━━━━━━
-*Документация v5*
-\`GET /api/v5/models\`           — все модели
-Query: \`?provider=flow\` | \`?media_type=image\`
-\`GET /api/v5/models/{model_id}\` — одна модель
-\`GET /api/v5/capabilities\`     — список + биллинг
-Query: \`?provider\` | \`?media_type\` | \`?model\`
-\`GET /api/v5/capabilities/{op}\` — одна capability
-\`GET /api/v5/providers\`        — провайдеры + модели
-\`GET /api/v5/usage\`            — статистика ключа
-
-━━━━━━━━━━━━━━━━━━━
 🤖 *OpenAI-COMPATIBLE API*
-
-*Chat Completions*
 \`POST /v1/chat/completions\`
-Body (OpenAI формат):
-  \`{"model":"openai/gpt-4o","messages":[...]}\`
-Модели: openai/gpt-4o | x-ai/grok-4 | google/gemini-2.5-flash
-Алиасы: gpt-4o | grok-4 | gemini-2.5-flash | openai/auto
+Body: \`{"model":"openai/gpt-4o","messages":[...]}\`
 Стриминг: \`"stream":true\` → SSE events
-💳 Токены → prompt_tokens_per_hour_limit
-
-*Список моделей*
-\`GET /v1/models\``
+💳 Токены → prompt\\_tokens\\_per\\_hour\\_limit`
   );
 
-  // Часть 5 — Storage + сводная таблица
+  // Часть 5 — Живые модели V5
+  parts.push(
+`📋 *V5 МОДЕЛИ — живые данные с API*
+
+${modelsText}`
+  );
+
+  // Часть 6 — Живые capabilities
+  parts.push(
+`⚡ *V5 CAPABILITIES — живые данные с API*
+
+${capsText}`
+  );
+
+  // Часть 7 — Провайдеры + чат-модели
+  parts.push(
+`🏭 *V5 ПРОВАЙДЕРЫ — живые данные с API*
+
+${providersText}
+
+━━━━━━━━━━━━━━━━━━━
+🤖 *OpenAI-compatible модели (/v1/models):*
+
+${chatModelsText}`
+  );
+
+  // Часть 8 — Storage + сводная таблица
   parts.push(
 `📦 *STORAGE SERVER*
 🌐 \`https://storage.fast-gen.ai\`
