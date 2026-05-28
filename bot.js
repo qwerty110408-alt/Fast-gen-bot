@@ -86,7 +86,8 @@ async function v5Create(body) {
   return data;
 }
 
-async function v5Poll(genId, maxAttempts = 90, interval = 10000) {
+// ИСПРАВЛЕНИЕ 4: увеличен таймаут поллинга до 30 минут (180 попыток × 10сек)
+async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(r => setTimeout(r, interval));
     let data;
@@ -241,7 +242,6 @@ const IMAGE_MODELS = {
 };
 
 // ─── GROK VIDEO DURATION ──────────────────
-// Длительность Grok видео влияет на стоимость: 6s = 1 кред, 10s = 3 кред
 const GROK_DURATIONS = {
   "6s":  { label: "6 сек (1 кред)",  duration: "6s",  credits: "1 кред/видео" },
   "10s": { label: "10 сек (3 кред)", duration: "10s", credits: "3 кред/видео" },
@@ -276,7 +276,7 @@ const DEFAULT_STATE = () => ({
   perPrompt: 1,
   seed: "random",
   resolution: "720p",
-  grokDuration: "6s",       // НОВОЕ: длительность Grok видео
+  grokDuration: "6s",
   batchType: "image",
   batchPrompts: [],
   batchPhotos: [],
@@ -285,7 +285,7 @@ const DEFAULT_STATE = () => ({
   batchVidModel: null,
   batchRatio: null,
   batchResolution: null,
-  batchGrokDuration: null,  // НОВОЕ: длительность Grok в пакете
+  batchGrokDuration: null,
   batchHourlyLimit: 15,
   keyframeStart: null,
   keyframeEnd: null,
@@ -358,18 +358,35 @@ function addHistory(chatId, entry) {
 // ─── Pending generators ────────────────────
 const pendingGenerators = new Map();
 
-// ─── НОВОЕ: хранилище задач с ошибками для перегенерации ──
-// Ключ: "chatId_errKey" → { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef }
+// ─── Хранилище задач с ошибками для перегенерации ──
 const failedTasks = new Map();
 
 function storeFailedTask(chatId, errKey, taskData) {
   failedTasks.set(`${chatId}_${errKey}`, taskData);
-  // Удаляем через 24 часа чтобы не накапливалось
   setTimeout(() => failedTasks.delete(`${chatId}_${errKey}`), 24 * 60 * 60 * 1000);
 }
 
 function getFailedTask(chatId, errKey) {
   return failedTasks.get(`${chatId}_${errKey}`);
+}
+
+// ─── ИСПРАВЛЕНИЕ 1: получение реального состояния лимитов из API ──
+async function getRealVideoUsage() {
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/v5/usage`, {
+      headers: v5Headers(), timeout: 10000,
+    });
+    const lim = data.account_limits || {};
+    const usage = data.current_usage || {};
+    return {
+      hourLimit: lim.video_gen_per_hour_limit || 15,
+      usedThisHour: usage.video_gen_this_hour || 0,
+      resetAt: usage.video_hour_reset_at ? new Date(usage.video_hour_reset_at).getTime() : null,
+    };
+  } catch(e) {
+    console.log(`[getRealVideoUsage] failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ─── Баланс UI ────────────────────────────
@@ -473,7 +490,7 @@ function showMiscMenu(chatId, msgId = null) {
   else bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
 }
 
-// ─── НОВОЕ: Меню длительности Grok ──────
+// ─── Меню длительности Grok ──────
 function showGrokDurationMenu(chatId, msgId = null) {
   const s = getState(chatId);
   const cur = s.grokDuration || "6s";
@@ -516,7 +533,6 @@ function showBatchSettingsMenu(chatId, msgId = null) {
 
   const ratioRows = [RATIOS.map(r => ({ text: `${ratio === r ? "✅ " : ""}${r}`, callback_data: `bset_ratio_${r.replace(":", "x")}` }))];
   const resRow = !isImage && isGrok ? [[["480p", "720p"].map(r => ({ text: `${resolution === r ? "✅ " : ""}${r}`, callback_data: `bset_res_${r}` }))]] : [];
-  // НОВОЕ: строка длительности Grok в настройках пакета
   const durRow = !isImage && isGrok ? [[["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с(1кр)" : "10с(3кр)"}`, callback_data: `bset_dur_${d}` }))]] : [];
 
   const kb = { inline_keyboard: [
@@ -769,18 +785,77 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
   await checkGeneration(msg.chat.id, match[1].trim());
 });
 
-// ─── Почасовой планировщик видео ─────────
+// ─── ИСПРАВЛЕНИЕ 1+2: Почасовой планировщик видео с реальным лимитом API ─────────
 const videoScheduler = {};
 
 async function scheduleVideoChunk(chatId) {
   const job = videoScheduler[chatId];
-  if (!job || job.tasks.length === 0) {
+  if (!job || job.stopped) {
     delete videoScheduler[chatId];
     return;
   }
-  const { tasks, model, batchS, hourlyLimit } = job;
-  const chunk = tasks.splice(0, hourlyLimit);
+  if (job.tasks.length === 0) {
+    await bot.editMessageText(
+      `✅ *Почасовой пакет завершён!*\n✓${job.doneSoFar} ✗${job.errorsSoFar}`,
+      { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }
+    ).catch(() => {});
+    delete videoScheduler[chatId];
+    showMainMenu(chatId);
+    return;
+  }
+
+  const { model, batchS, hourlyLimit } = job;
   const total = job.totalTasks;
+
+  // ИСПРАВЛЕНИЕ 1: Спрашиваем у API сколько видео уже отправлено в этом часу
+  // и сколько ещё можно отправить, чтобы не превысить лимит
+  let allowedThisChunk = hourlyLimit;
+  let waitMs = 0;
+  let resetTime = "";
+
+  const realUsage = await getRealVideoUsage();
+  if (realUsage) {
+    const apiLimit = Math.min(hourlyLimit, realUsage.hourLimit); // берём меньший из двух лимитов
+    const usedAlready = realUsage.usedThisHour || 0;
+    const remaining = Math.max(0, apiLimit - usedAlready);
+
+    console.log(`[scheduler] API usage: used=${usedAlready}/${apiLimit}, remaining=${remaining}`);
+
+    if (remaining === 0) {
+      // Лимит исчерпан — ждём реального сброса от API
+      if (realUsage.resetAt && realUsage.resetAt > Date.now()) {
+        waitMs = realUsage.resetAt - Date.now() + 5000; // +5сек запас
+      } else {
+        // API не вернул resetAt — ждём до следующего часа по локальному времени
+        waitMs = Math.max(60000, nextHourReset() - Date.now() + 5000);
+      }
+      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+      await bot.sendMessage(chatId,
+        `⏳ Лимит API исчерпан (использовано ${usedAlready}/${apiLimit}).\n` +
+        `🕐 Следующая пачка в *${resetTime}* UTC.\nМожно закрыть приложение — бот продолжит.`,
+        { parse_mode: "Markdown" });
+      setTimeout(() => scheduleVideoChunk(chatId), waitMs);
+      return;
+    }
+    allowedThisChunk = remaining;
+  } else {
+    // Не удалось получить данные из API — используем локальный счётчик как раньше
+    checkResetBalance();
+    const usedLocal = balanceState.videos || 0;
+    const remaining = Math.max(0, hourlyLimit - usedLocal);
+    if (remaining === 0) {
+      waitMs = Math.max(60000, balanceState.resetAt - Date.now() + 5000);
+      resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+      await bot.sendMessage(chatId,
+        `⏳ Локальный лимит исчерпан.\n🕐 Следующая пачка в *${resetTime}* UTC.\nМожно закрыть приложение — бот продолжит.`,
+        { parse_mode: "Markdown" });
+      setTimeout(() => scheduleVideoChunk(chatId), waitMs);
+      return;
+    }
+    allowedThisChunk = remaining;
+  }
+
+  const chunk = job.tasks.splice(0, allowedThisChunk);
 
   const statusText = () =>
     `⏰ *Почасовой пакет (видео)*\n` +
@@ -796,25 +871,33 @@ async function scheduleVideoChunk(chatId) {
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
   }
 
-  const chunkPromises = chunk.map(task =>
-    videoQueue(async () => {
-      try {
-        // ИСПРАВЛЕНО: передаём isScheduled=true чтобы не показывать главное меню после каждой задачи
-        await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
-        job.doneSoFar++;
-      } catch {
-        job.errorsSoFar++;
-      }
-      await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
-    })
-  );
-  await Promise.allSettled(chunkPromises);
+  // Запускаем задачи строго последовательно одну за одной,
+  // чтобы точно не превысить лимит: следующая стартует только после завершения предыдущей
+  for (const task of chunk) {
+    if (job.stopped) break;
+    try {
+      await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
+      job.doneSoFar++;
+    } catch {
+      job.errorsSoFar++;
+    }
+    await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
+  }
+
+  if (job.stopped) {
+    delete videoScheduler[chatId];
+    return;
+  }
 
   if (job.tasks.length > 0) {
-    checkResetBalance();
-    const msLeft = Math.max(5000, balanceState.resetAt - Date.now());
-    const waitMs = msLeft + 3000;
-    const resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
+    // После завершения пачки снова спрашиваем API когда сбросится лимит
+    const usageAfter = await getRealVideoUsage();
+    if (usageAfter && usageAfter.resetAt && usageAfter.resetAt > Date.now()) {
+      waitMs = usageAfter.resetAt - Date.now() + 5000;
+    } else {
+      waitMs = Math.max(60000, nextHourReset() - Date.now() + 5000);
+    }
+    resetTime = new Date(Date.now() + waitMs).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" });
     await bot.sendMessage(chatId,
       `⏳ Пачка завершена: ✓${job.doneSoFar} ✗${job.errorsSoFar}\n` +
       `Осталось *${job.tasks.length}* задач.\n` +
@@ -833,11 +916,8 @@ async function scheduleVideoChunk(chatId) {
 }
 
 // ─── Генерация одной задачи (v5) ──────────
-// isScheduled=true → не показываем главное меню, не прерываем scheduler
 async function genOne(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null, isScheduled = false) {
   const label = batchIdx || (total > 1 ? `${index}/${total}` : "");
-
-  // НОВОЕ: уникальный ключ для хранения задачи при ошибке
   const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
   const body = {
@@ -847,7 +927,6 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     ...(s.seed === "fixed" && { seed: 42 }),
     ...(model.quality && { quality: model.quality }),
     ...(model.hasResolution && { resolution: s.resolution || "720p" }),
-    // НОВОЕ: длительность для Grok видео
     ...(model.hasDuration && s.grokDuration && { duration: s.grokDuration }),
   };
 
@@ -858,7 +937,6 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
 
   console.log(`[genOne] operation=${operation} label=${label} bodyKeys=${Object.keys(body).join(",")}`);
 
-  // Данные задачи для сохранения на случай ошибки
   const taskData = {
     prompt, operation, model,
     isImage, ratio: s.ratio,
@@ -880,7 +958,6 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     console.error(`[genOne] create failed: ${status}${errStr}`);
     addHistory(chatId, { model: model.label, prompt, genId: "error", operation, isImage, ratio: s.ratio });
 
-    // НОВОЕ: сохраняем задачу и показываем кнопку перегенерации
     storeFailedTask(chatId, errKey, taskData);
     await bot.sendMessage(chatId,
       `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
@@ -902,7 +979,6 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
   } catch(e) {
     console.error(`[genOne] poll failed genId=${genId}: ${e.message}`);
 
-    // НОВОЕ: сохраняем задачу и показываем кнопку перегенерации
     storeFailedTask(chatId, errKey, taskData);
     await bot.sendMessage(chatId,
       `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${e.message.slice(0, 400)}`,
@@ -916,7 +992,6 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
 
   if (isImage) spendBalance("images", 1);
   else {
-    // НОВОЕ: учитываем стоимость Grok видео (1 или 3 кред)
     const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
     spendBalance("videos", vidCost);
   }
@@ -944,7 +1019,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
   }
 }
 
-// ─── НОВОЕ: Перегенерация задачи с ошибкой ──
+// ─── Перегенерация задачи с ошибкой ──
 async function retryFailedTask(chatId, errKey) {
   const task = getFailedTask(chatId, errKey);
   if (!task) {
@@ -953,7 +1028,6 @@ async function retryFailedTask(chatId, errKey) {
 
   const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed } = task;
 
-  // Создаём временный s-объект с параметрами задачи
   const fakeS = {
     ratio,
     resolution: resolution || "720p",
@@ -970,7 +1044,6 @@ async function retryFailedTask(chatId, errKey) {
   try {
     await genOne(chatId, fakeS, prompt, operation, model, isImage, 0, 0, null, imageRef, false);
     await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
-    // Удаляем из хранилища после успешной перегенерации
     failedTasks.delete(`${chatId}_${errKey}`);
   } catch(e) {
     await bot.editMessageText(
@@ -1171,13 +1244,14 @@ async function runBatch(chatId) {
   const hourlyLimit = s.batchHourlyLimit || 15;
 
   if (!isImage && total > hourlyLimit) {
-    // Почасовой режим для видео — ИСПРАВЛЕНО: очищаем промпты только здесь
+    // Почасовой режим для видео
     videoScheduler[chatId] = {
       tasks: [...tasks],
       totalTasks: total,
       doneSoFar: 0,
       errorsSoFar: 0,
       statusMsgId: null,
+      stopped: false,
       hourlyLimit,
       model,
       batchS,
@@ -1193,7 +1267,7 @@ async function runBatch(chatId) {
     return;
   }
 
-  // Обычный пакет
+  // Обычный пакет (изображения или видео не превышающее лимит)
   const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
@@ -1201,7 +1275,6 @@ async function runBatch(chatId) {
     { parse_mode: "Markdown" });
 
   const allTasks = tasks.map(task =>
-    // ИСПРАВЛЕНО: передаём isScheduled=true чтобы genOne не вызывал showMainMenu внутри пакета
     queue(() => genOne(chatId, batchS, task.prompt, task.operation, model, isImage, 0, 0, task.idx, task.imageRef || null, true))
       .then(() => done++)
       .catch(() => errors++)
@@ -1298,7 +1371,7 @@ bot.on("callback_query", async (query) => {
   if (data === "open_misc")     { s.menuMsgId = msgId; return showMiscMenu(chatId, msgId); }
   if (data === "show_history")  { s.menuMsgId = msgId; return showHistoryMenu(chatId, msgId, 0); }
 
-  // НОВОЕ: обработчик перегенерации ошибочных задач
+  // Перегенерация ошибочных задач
   if (data.startsWith("retry_err_")) {
     const errKey = data.replace("retry_err_", "");
     return retryFailedTask(chatId, errKey);
@@ -1450,7 +1523,6 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("bset_vm_")) { s.batchVidModel = data.replace("bset_vm_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
   if (data.startsWith("bset_ratio_")) { s.batchRatio = data.replace("bset_ratio_", "").replace("x", ":"); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
   if (data.startsWith("bset_res_")) { s.batchResolution = data.replace("bset_res_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
-  // НОВОЕ: длительность Grok в настройках пакета
   if (data.startsWith("bset_dur_")) { s.batchGrokDuration = data.replace("bset_dur_", ""); saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
   if (data === "bset_reset") { s.batchImgModel = null; s.batchVidModel = null; s.batchRatio = null; s.batchResolution = null; s.batchGrokDuration = null; saveState(chatId); return showBatchSettingsMenu(chatId, msgId); }
 
@@ -1506,7 +1578,7 @@ bot.on("callback_query", async (query) => {
   }
   if (data.startsWith("set_res_")) { s.resolution = data.replace("set_res_", ""); saveState(chatId); return showMiscMenu(chatId, msgId); }
 
-  // НОВОЕ: длительность Grok видео
+  // Длительность Grok видео
   if (data === "open_grok_duration") return showGrokDurationMenu(chatId, msgId);
   if (data === "set_grok_dur_6s")  { s.grokDuration = "6s";  saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
   if (data === "set_grok_dur_10s") { s.grokDuration = "10s"; saveState(chatId); return showGrokDurationMenu(chatId, msgId); }
@@ -1550,16 +1622,38 @@ bot.on("callback_query", async (query) => {
     return genFn(rawPrompt);
   }
 
-  // ── Отмена операций
+  // ── ИСПРАВЛЕНИЕ 3: Отмена всех задач — останавливает scheduler и шлёт cancel-all в API
   if (data === "cancel_all_ops") {
     await bot.answerCallbackQuery(query.id, { text: "⏳ Отменяю..." });
+
+    // Останавливаем почасовой scheduler если он запущен
+    if (videoScheduler[chatId]) {
+      videoScheduler[chatId].stopped = true;
+      await bot.sendMessage(chatId, "🛑 Почасовой пакет остановлен.");
+    }
+
+    // Сбрасываем все pending состояния
+    const s2 = getState(chatId);
+    s2.step = null;
+    if (s2.pendingGenKey) {
+      pendingGenerators.delete(s2.pendingGenKey);
+      s2.pendingGenKey = null;
+    }
+    s2.pendingPrompt = null;
+    s2.pendingMsgId = null;
+
     try {
       const { data: res } = await axios.get(`${BASE_URL}/api/v5/operations/cancel-all`, {
         headers: v5Headers(), timeout: 15000,
       });
-      await bot.sendMessage(chatId, `✅ Отменено: ${res.total_cancelled}, возвращено: ${res.total_refunded}`);
+      const found = res.total_found ?? "?";
+      const cancelled = res.total_cancelled ?? "?";
+      const refunded = res.total_refunded ?? "?";
+      await bot.sendMessage(chatId,
+        `✅ *Отмена завершена*\nНайдено: ${found} | Отменено: ${cancelled} | Возвращено: ${refunded}`,
+        { parse_mode: "Markdown" });
     } catch(e) {
-      await bot.sendMessage(chatId, `❌ Ошибка отмены: ${e.message.slice(0, 200)}`);
+      await bot.sendMessage(chatId, `❌ Ошибка отмены в API: ${e.message.slice(0, 200)}`);
     }
     return showBalance(chatId, msgId);
   }
