@@ -57,7 +57,16 @@ async function uploadToStorage(buffer, filename = "image.jpg") {
   return `file:${data.file_hash}`;
 }
 
-// ─── Загрузить фото из Telegram → storage ref ──
+// ─── Загрузить фото из Telegram → base64 data URI (для inputs v5) ──
+async function tgPhotoToDataUri(fileId) {
+  const f = await bot.getFile(fileId);
+  const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+  const ext = f.file_path.split(".").pop().toLowerCase();
+  const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+  return `data:${mime};base64,${Buffer.from(resp.data).toString("base64")}`;
+}
+
+// ─── Загрузить фото из Telegram → storage ref (для batch) ──
 async function tgPhotoToRef(fileId) {
   const f = await bot.getFile(fileId);
   const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
@@ -235,6 +244,8 @@ async function formatBalance() {
 }
 
 // ─── Модели ───────────────────────────────
+// operation — это то что идёт в v5 generations body
+// для видео: operation меняется в зависимости от режима (text/image/keyframes)
 const IMAGE_MODELS = {
   "imagen4":    { label: "Imagen 4",           operation: "imagen_4_image_generate",         credits: "4 кред/фото" },
   "nanopro":    { label: "NanoBanana Pro",      operation: "nano_banana_pro_image_generate",  credits: "4 кред/фото" },
@@ -798,6 +809,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     ...(model.hasResolution && { resolution: s.resolution || "720p" }),
   };
 
+  // Добавляем изображения как inputs (storage refs)
   const refs = imageRef ? [imageRef] : (s.pendingRefImages && s.pendingRefImages.length > 0 ? s.pendingRefImages : null);
   if (refs && refs.length > 0) {
     body.inputs = refs;
@@ -966,9 +978,10 @@ async function runKeyframes(chatId, s, prompt) {
     }
     const statusMsg = await bot.sendMessage(chatId, `⏳ Ключевые кадры...\n🎥 ${model.label}`);
     try {
+      // Загружаем кадры в storage
       const inputs = [];
-      if (s.keyframeStart) inputs.push(await tgPhotoToRef(s.keyframeStart));
-      if (s.keyframeEnd) inputs.push(await tgPhotoToRef(s.keyframeEnd));
+      if (s.keyframeStart) inputs.push(await tgPhotoToDataUri(s.keyframeStart));
+      if (s.keyframeEnd) inputs.push(await tgPhotoToDataUri(s.keyframeEnd));
 
       const body = {
         operation: model.opKf,
@@ -1006,18 +1019,19 @@ async function runBatch(chatId) {
   const isVideoImage = bt === "video_image";
   const batchS = { ...s, ratio, resolution };
   const prompts = [...s.batchPrompts];
-  const photos = [...s.batchPhotos];
+  const photos = [...s.batchPhotos]; // это fileId из Telegram
   const perPrompt = s.perPrompt || 1;
 
   if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
   if (isVideoImage && photos.length === 0) return bot.sendMessage(chatId, "❌ Добавь фото для режима «Видео из фото»!");
 
+  // Конвертируем фото в base64 data URI (не storage — чтобы не протухли за 1 час)
   let photoRefs = [];
   if (isVideoImage && photos.length > 0) {
-    const uploadMsg = await bot.sendMessage(chatId, `⏳ Загружаю ${photos.length} фото в storage...`);
+    const uploadMsg = await bot.sendMessage(chatId, `⏳ Подготавливаю ${photos.length} фото...`);
     try {
-      photoRefs = await Promise.all(photos.map(fid => tgPhotoToRef(fid)));
-      await bot.editMessageText(`✅ Фото загружены (${photoRefs.length})`, { chat_id: chatId, message_id: uploadMsg.message_id });
+      photoRefs = await Promise.all(photos.map(fid => tgPhotoToDataUri(fid)));
+      await bot.editMessageText(`✅ Фото готовы (${photoRefs.length})`, { chat_id: chatId, message_id: uploadMsg.message_id });
     } catch(e) {
       await bot.editMessageText(`❌ Ошибка загрузки фото: ${e.message}`, { chat_id: chatId, message_id: uploadMsg.message_id });
       return;
@@ -1046,6 +1060,7 @@ async function runBatch(chatId) {
   const hourlyLimit = s.batchHourlyLimit || 15;
 
   if (!isImage && total > hourlyLimit) {
+    // Почасовой режим для видео
     videoScheduler[chatId] = {
       tasks: [...tasks],
       totalTasks: total,
@@ -1067,6 +1082,7 @@ async function runBatch(chatId) {
     return;
   }
 
+  // Обычный пакет
   const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
@@ -1509,8 +1525,8 @@ bot.on("photo", async (msg) => {
     if (s.pendingRefImages.length >= 10)
       return bot.sendMessage(chatId, "❌ Максимум 10 референсов!");
     try {
-      const ref = await tgPhotoToRef(fileId);
-      s.pendingRefImages.push(ref);
+      const dataUri = await tgPhotoToDataUri(fileId);
+      s.pendingRefImages.push(dataUri);
       return bot.sendMessage(chatId, `✅ Референс ${s.pendingRefImages.length}/10 добавлен!`, {
         reply_markup: { inline_keyboard: [
           [{ text: `✅ Готово (${s.pendingRefImages.length} фото)`, callback_data: "ref_photos_done" }],
@@ -1527,8 +1543,8 @@ bot.on("photo", async (msg) => {
     if (s.pendingRefImages.length >= maxRef)
       return bot.sendMessage(chatId, `❌ Максимум ${maxRef} фото!`);
     try {
-      const ref = await tgPhotoToRef(fileId);
-      s.pendingRefImages.push(ref);
+      const dataUri = await tgPhotoToDataUri(fileId);
+      s.pendingRefImages.push(dataUri);
       return bot.sendMessage(chatId, `✅ Фото ${s.pendingRefImages.length}/${maxRef} добавлено!`, {
         reply_markup: { inline_keyboard: [
           [{ text: `✅ Готово (${s.pendingRefImages.length} фото)`, callback_data: "vid_ref_photos_done" }],
@@ -1543,8 +1559,8 @@ bot.on("photo", async (msg) => {
   s.tab = "video_ref"; s.pendingRefImages = []; s.step = "waiting_prompt"; s.mode = "normal";
   const vm = VIDEO_MODELS[s.vidModel];
   try {
-    const ref = await tgPhotoToRef(fileId);
-    s.pendingRefImages = [ref];
+    const dataUri = await tgPhotoToDataUri(fileId);
+    s.pendingRefImages = [dataUri];
     bot.sendMessage(chatId, `✅ Фото готово!\n\n🎬 *${vm.label}* (${vm.credits})\n\nНапиши описание для видео:`, {
       parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [
