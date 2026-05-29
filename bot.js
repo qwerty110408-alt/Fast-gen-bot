@@ -1329,13 +1329,20 @@ async function runBatch(chatId) {
     `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
 
-  // 10 параллельных потоков, результаты отправляются строго по порядку
+  // 10 параллельных потоков, отправка строго по порядку индексов
+  // Схема: для каждой задачи заранее создаём resolve/reject-слот.
+  // Задача кладёт результат в свой слот как только готова.
+  // Отдельный цикл-sender проходит слоты по порядку и отправляет.
   const CONCURRENCY = 10;
-  // Каждая задача: генерируем параллельно, отправляем по цепочке
-  // sendChain — промис предыдущей отправки, ждём его перед отправкой текущей
-  let sendChain = Promise.resolve();
 
-  async function genOneOrdered(task) {
+  // Слоты: { resolve, reject } — задача сигналит сюда, sender читает по порядку
+  const slots = tasks.map(() => {
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  });
+
+  async function genOneParallel(task, slotIndex) {
     const taskModel = task.model || model;
     const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const MAX_RETRIES = 5;
@@ -1388,28 +1395,9 @@ async function runBatch(chatId) {
             spendBalance("videos", vidCost);
           }
         }
-        // Ждём своей очереди на отправку
-        const myResults = pollResult.results;
-        sendChain = sendChain.then(async () => {
-          const idxStr = `*${label}* `;
-          const caption = `${idxStr}${taskModel.label}\n📝 _${task.prompt.slice(0, 100)}_`;
-          const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
-          try {
-            for (const item of myResults) {
-              let media;
-              if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
-              else if (item.download_path) {
-                const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
-                media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
-              }
-              if (media) await sendV5Media(chatId, media, caption, regenKb);
-            }
-          } catch(e) {
-            console.error(`[runBatch] sendMedia failed [${label}]: ${e.message}`);
-            await bot.sendMessage(chatId, `⚠️ [${label}] Генерация завершена, но отправка не удалась\n${e.message.slice(0, 300)}`).catch(() => {});
-          }
-        });
-        return; // успех
+        // Кладём результат в свой слот — sender отправит в нужный момент
+        slots[slotIndex].resolve({ ok: true, results: pollResult.results, taskModel, label, prompt: task.prompt });
+        return;
       } catch(e) {
         const errMsg = e.message || "";
         const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
@@ -1420,38 +1408,62 @@ async function runBatch(chatId) {
       }
     }
 
-    // Все 5 попыток исчерпаны — ставим ошибку в очередь отправки в нужном порядке
+    // Все 5 попыток исчерпаны
     storeFailedTask(chatId, errKey, taskData);
-    sendChain = sendChain.then(async () => {
-      await bot.sendMessage(chatId,
-        `❌ *Ошибка после ${MAX_RETRIES} попыток* [${label}]\n` +
-        `🤖 ${taskModel.label}\n` +
-        `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
-        `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-        }
-      ).catch(() => {});
-    });
-    throw lastError || new Error("Max retries exceeded");
+    slots[slotIndex].resolve({ ok: false, errKey, lastError, lastRefunded, taskModel, label, MAX_RETRIES });
   }
 
-  // Запускаем через семафор (10 потоков)
-  const sem = createQueue(CONCURRENCY);
-  const allTasks = tasks.map(task =>
-    sem(() => genOneOrdered(task))
-      .then(() => done++)
-      .catch(() => errors++)
-      .finally(() => {
-        bot.editMessageText(
-          `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
-          { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+  // Sender — читает слоты строго по порядку и отправляет
+  async function sender() {
+    for (let i = 0; i < slots.length; i++) {
+      const result = await slots[i].promise;
+      if (result.ok) {
+        const { results: myResults, taskModel, label, prompt: taskPrompt } = result;
+        const caption = `*${label}* ${taskModel.label}\n📝 _${taskPrompt.slice(0, 100)}_`;
+        const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
+        try {
+          for (const item of myResults) {
+            let media;
+            if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
+            else if (item.download_path) {
+              const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
+              media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
+            }
+            if (media) await sendV5Media(chatId, media, caption, regenKb);
+          }
+          done++;
+        } catch(e) {
+          console.error(`[runBatch] sendMedia failed [${label}]: ${e.message}`);
+          await bot.sendMessage(chatId, `⚠️ [${label}] Генерация завершена, но отправка не удалась\n${e.message.slice(0, 300)}`).catch(() => {});
+          errors++;
+        }
+      } else {
+        const { errKey, lastError, lastRefunded, taskModel, label, MAX_RETRIES } = result;
+        await bot.sendMessage(chatId,
+          `❌ *Ошибка после ${MAX_RETRIES} попыток* [${label}]\n` +
+          `🤖 ${taskModel.label}\n` +
+          `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
+          `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+          }
         ).catch(() => {});
-      })
-  );
-  await Promise.allSettled(allTasks);
-  await sendChain; // ждём последней отправки
+        errors++;
+      }
+      bot.editMessageText(
+        `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
+  }
+
+  // Запускаем генерацию (10 потоков) и sender параллельно
+  const sem = createQueue(CONCURRENCY);
+  await Promise.all([
+    Promise.allSettled(tasks.map((task, i) => sem(() => genOneParallel(task, i)))),
+    sender(),
+  ]);
   await bot.editMessageText(
     `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
     { chat_id: chatId, message_id: statusMsg.message_id }
