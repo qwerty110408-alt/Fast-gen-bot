@@ -1329,145 +1329,45 @@ async function runBatch(chatId) {
     `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
 
-  // 10 параллельных потоков, отправка строго по порядку индексов
-  // Схема: для каждой задачи заранее создаём resolve/reject-слот.
-  // Задача кладёт результат в свой слот как только готова.
-  // Отдельный цикл-sender проходит слоты по порядку и отправляет.
-  const CONCURRENCY = 10;
-
-  // Слоты: { resolve, reject } — задача сигналит сюда, sender читает по порядку
-  const slots = tasks.map(() => {
-    let resolve, reject;
-    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-    return { promise, resolve, reject };
-  });
-
-  async function genOneParallel(task, slotIndex) {
-    const taskModel = task.model || model;
-    const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const MAX_RETRIES = 5;
-    const label = task.idx;
-    const body = {
-      operation: task.operation,
-      prompt: task.prompt,
-      aspect_ratio: batchS.ratio,
-      ...(batchS.seed === "fixed" && { seed: 42 }),
-      ...(taskModel.quality && { quality: taskModel.quality }),
-      ...(taskModel.hasResolution && { resolution: batchS.resolution || "720p" }),
-      ...(taskModel.hasDuration && batchS.grokDuration && { duration: batchS.grokDuration }),
-    };
-    if (task.imageRef) body.inputs = [task.imageRef];
-    else if (batchS.pendingRefImages && batchS.pendingRefImages.length > 0) body.inputs = batchS.pendingRefImages;
-
-    const taskData = {
-      prompt: task.prompt, operation: task.operation, model: taskModel,
-      isImage, ratio: batchS.ratio, resolution: batchS.resolution || "720p",
-      grokDuration: batchS.grokDuration || "6s", imageRef: task.imageRef || null, seed: batchS.seed,
-    };
-
-    let lastError = null, lastRefunded = false;
-
-    for (let retry = 0; retry < MAX_RETRIES; retry++) {
-      let genId;
+  // Для видео из фото — последовательная обработка для сохранения порядка
+  if (!isImage && isVideoImage && photos.length > 0) {
+    for (const task of tasks) {
       try {
-        const created = await v5Create(body);
-        genId = created.id;
-        if (!genId) throw new Error(`v5Create returned no id: ${JSON.stringify(created).slice(0, 200)}`);
+        await genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false);
+        done++;
       } catch(e) {
-        const detail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
-        const status = e.response?.status ? `[HTTP ${e.response.status}] ` : "";
-        const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
-        console.error(`[runBatch] create failed [${label}] retry ${retry + 1}/${MAX_RETRIES}: ${status}${errStr}`);
-        lastError = new Error(`${status}${errStr}`);
-        lastRefunded = false;
-        continue;
-      }
-
-      addHistory(chatId, { model: taskModel.label, prompt: task.prompt, genId, operation: task.operation, isImage, ratio: batchS.ratio });
-
-      try {
-        const pollResult = await v5Poll(genId);
-        const usage = pollResult.usage;
-        if (!usage || usage.refunded !== true) {
-          if (isImage) spendBalance("images", 1);
-          else {
-            const vidCost = taskModel.hasDuration ? getGrokVideoCredits(batchS.grokDuration || "6s") : 1;
-            spendBalance("videos", vidCost);
-          }
-        }
-        // Кладём результат в свой слот — sender отправит в нужный момент
-        slots[slotIndex].resolve({ ok: true, results: pollResult.results, taskModel, label, prompt: task.prompt });
-        return;
-      } catch(e) {
-        const errMsg = e.message || "";
-        const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
-        lastRefunded = refundedMatch ? refundedMatch[1] === "true" : false;
-        lastError = new Error(errMsg.replace(/\|REFUNDED:(true|false)/, ""));
-        console.error(`[runBatch] poll failed [${label}] retry ${retry + 1}/${MAX_RETRIES}: ${lastError.message}`);
-        continue;
-      }
-    }
-
-    // Все 5 попыток исчерпаны
-    storeFailedTask(chatId, errKey, taskData);
-    slots[slotIndex].resolve({ ok: false, errKey, lastError, lastRefunded, taskModel, label, MAX_RETRIES });
-  }
-
-  // Sender — читает слоты строго по порядку и отправляет
-  async function sender() {
-    for (let i = 0; i < slots.length; i++) {
-      const result = await slots[i].promise;
-      if (result.ok) {
-        const { results: myResults, taskModel, label, prompt: taskPrompt } = result;
-        const caption = `*${label}* ${taskModel.label}\n📝 _${taskPrompt.slice(0, 100)}_`;
-        const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
-        try {
-          for (const item of myResults) {
-            let media;
-            if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
-            else if (item.download_path) {
-              const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
-              media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
-            }
-            if (media) await sendV5Media(chatId, media, caption, regenKb);
-          }
-          done++;
-        } catch(e) {
-          console.error(`[runBatch] sendMedia failed [${label}]: ${e.message}`);
-          await bot.sendMessage(chatId, `⚠️ [${label}] Генерация завершена, но отправка не удалась\n${e.message.slice(0, 300)}`).catch(() => {});
-          errors++;
-        }
-      } else {
-        const { errKey, lastError, lastRefunded, taskModel, label, MAX_RETRIES } = result;
-        await bot.sendMessage(chatId,
-          `❌ *Ошибка после ${MAX_RETRIES} попыток* [${label}]\n` +
-          `🤖 ${taskModel.label}\n` +
-          `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
-          `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-          }
-        ).catch(() => {});
+        console.error(`[runBatch] task failed: ${task.idx}: ${e.message}`);
         errors++;
       }
       bot.editMessageText(
-        `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+        `📦 Пакет (последовательно): ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
         { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
       ).catch(() => {});
     }
+    await bot.editMessageText(
+      `✅ Пакет готов (последовательно)! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+      { chat_id: chatId, message_id: statusMsg.message_id }
+    ).catch(() => {});
+  } else {
+    // Для остальных — параллельная очередь
+    const queue = isImage ? imageQueue : videoQueue;
+    const allTasks = tasks.map(task =>
+      queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
+        .then(() => done++)
+        .catch(() => errors++)
+        .finally(() => {
+          bot.editMessageText(
+            `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+            { chat_id: chatId, message_id: statusMsg.message_id }
+          ).catch(() => {});
+        })
+    );
+    await Promise.allSettled(allTasks);
+    await bot.editMessageText(
+      `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+      { chat_id: chatId, message_id: statusMsg.message_id }
+    ).catch(() => {});
   }
-
-  // Запускаем генерацию (10 потоков) и sender параллельно
-  const sem = createQueue(CONCURRENCY);
-  await Promise.all([
-    Promise.allSettled(tasks.map((task, i) => sem(() => genOneParallel(task, i)))),
-    sender(),
-  ]);
-  await bot.editMessageText(
-    `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
-    { chat_id: chatId, message_id: statusMsg.message_id }
-  ).catch(() => {});
   s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
   showMainMenu(chatId);
 }
