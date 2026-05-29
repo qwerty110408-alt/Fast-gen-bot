@@ -1329,45 +1329,24 @@ async function runBatch(chatId) {
     `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
 
-  // Для видео из фото — последовательная обработка для сохранения порядка
-  if (!isImage && isVideoImage && photos.length > 0) {
-    for (const task of tasks) {
-      try {
-        await genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false);
-        done++;
-      } catch(e) {
-        console.error(`[runBatch] task failed: ${task.idx}: ${e.message}`);
-        errors++;
-      }
-      bot.editMessageText(
-        `📦 Пакет (последовательно): ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
-        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
-      ).catch(() => {});
+  // Все режимы — последовательная обработка для сохранения порядка 1..N
+  for (const task of tasks) {
+    try {
+      await genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false);
+      done++;
+    } catch(e) {
+      console.error(`[runBatch] task failed: ${task.idx}: ${e.message}`);
+      errors++;
     }
-    await bot.editMessageText(
-      `✅ Пакет готов (последовательно)! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
-      { chat_id: chatId, message_id: statusMsg.message_id }
-    ).catch(() => {});
-  } else {
-    // Для остальных — параллельная очередь
-    const queue = isImage ? imageQueue : videoQueue;
-    const allTasks = tasks.map(task =>
-      queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
-        .then(() => done++)
-        .catch(() => errors++)
-        .finally(() => {
-          bot.editMessageText(
-            `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
-            { chat_id: chatId, message_id: statusMsg.message_id }
-          ).catch(() => {});
-        })
-    );
-    await Promise.allSettled(allTasks);
-    await bot.editMessageText(
-      `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
-      { chat_id: chatId, message_id: statusMsg.message_id }
+    bot.editMessageText(
+      `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
     ).catch(() => {});
   }
+  await bot.editMessageText(
+    `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+    { chat_id: chatId, message_id: statusMsg.message_id }
+  ).catch(() => {});
   s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
   showMainMenu(chatId);
 }
