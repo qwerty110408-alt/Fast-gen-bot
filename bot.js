@@ -1324,50 +1324,28 @@ async function runBatch(chatId) {
     return;
   }
 
+  const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
     `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
 
-  // Для видео из фото — последовательная обработка для сохранения порядка
-  if (!isImage && isVideoImage && photos.length > 0) {
-    for (const task of tasks) {
-      try {
-        await genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false);
-        done++;
-      } catch(e) {
-        console.error(`[runBatch] task failed: ${task.idx}: ${e.message}`);
-        errors++;
-      }
-      bot.editMessageText(
-        `📦 Пакет (последовательно): ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
-        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
-      ).catch(() => {});
-    }
-    await bot.editMessageText(
-      `✅ Пакет готов (последовательно)! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
-      { chat_id: chatId, message_id: statusMsg.message_id }
-    ).catch(() => {});
-  } else {
-    // Для остальных — параллельная очередь
-    const queue = isImage ? imageQueue : videoQueue;
-    const allTasks = tasks.map(task =>
-      queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
-        .then(() => done++)
-        .catch(() => errors++)
-        .finally(() => {
-          bot.editMessageText(
-            `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
-            { chat_id: chatId, message_id: statusMsg.message_id }
-          ).catch(() => {});
-        })
-    );
-    await Promise.allSettled(allTasks);
-    await bot.editMessageText(
-      `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
-      { chat_id: chatId, message_id: statusMsg.message_id }
-    ).catch(() => {});
-  }
+  const allTasks = tasks.map(task =>
+    queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
+      .then(() => done++)
+      .catch(() => errors++)
+      .finally(() => {
+        bot.editMessageText(
+          `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+          { chat_id: chatId, message_id: statusMsg.message_id }
+        ).catch(() => {});
+      })
+  );
+  await Promise.allSettled(allTasks);
+  await bot.editMessageText(
+    `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+    { chat_id: chatId, message_id: statusMsg.message_id }
+  ).catch(() => {});
   s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
   showMainMenu(chatId);
 }
@@ -1431,7 +1409,6 @@ async function checkGeneration(chatId, genId) {
 
 // ─── Callback handler ─────────────────────
 const mediaGroupTimers = new Map();
-const mediaGroupBuffers = new Map(); // буфер для media group: media_group_id -> [{ fileId, messageId }]
 
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
@@ -1783,40 +1760,17 @@ bot.on("photo", async (msg) => {
     const bt = s.batchType || "image";
     if (bt === "video_image") {
       if (s.batchPhotos.length >= 500) return bot.sendMessage(chatId, "❌ Максимум 500 фото в пакете!");
+      s.batchPhotos.push(fileId);
       if (msg.media_group_id) {
-        // Media group — накапливаем фото в буфер
-        if (!mediaGroupBuffers.has(msg.media_group_id)) {
-          mediaGroupBuffers.set(msg.media_group_id, []);
-        }
-        mediaGroupBuffers.get(msg.media_group_id).push({ fileId, messageId: msg.message_id });
-
         if (mediaGroupTimers.has(msg.media_group_id)) clearTimeout(mediaGroupTimers.get(msg.media_group_id));
         const t = setTimeout(() => {
-          // Сортируем по message_id для сохранения порядка отправки
-          const buffer = mediaGroupBuffers.get(msg.media_group_id) || [];
-          buffer.sort((a, b) => a.messageId - b.messageId);
-          const count = buffer.length;
-          const currentTotal = s.batchPhotos.length;
-          if (currentTotal + count > 500) {
-            const allowed = 500 - currentTotal;
-            for (let i = 0; i < allowed; i++) s.batchPhotos.push(buffer[i].fileId);
-            bot.sendMessage(chatId, `✅ Добавлено ${allowed}/${count} фото (лимит 500). Всего: ${s.batchPhotos.length}`, {
-              reply_markup: { inline_keyboard: [[{ text: "📦 Меню пакета", callback_data: "do_batch_menu" }]] }
-            });
-          } else {
-            for (const item of buffer) s.batchPhotos.push(item.fileId);
-            bot.sendMessage(chatId, `✅ Фото добавлены! Всего: ${s.batchPhotos.length}`, {
-              reply_markup: { inline_keyboard: [[{ text: "📦 Меню пакета", callback_data: "do_batch_menu" }]] }
-            });
-          }
           mediaGroupTimers.delete(msg.media_group_id);
-          mediaGroupBuffers.delete(msg.media_group_id);
+          bot.sendMessage(chatId, `✅ Фото добавлены! Всего: ${s.batchPhotos.length}`, {
+            reply_markup: { inline_keyboard: [[{ text: "📦 Меню пакета", callback_data: "do_batch_menu" }]] }
+          });
         }, 1500);
         mediaGroupTimers.set(msg.media_group_id, t);
         return;
-      } else {
-        // Одиночное фото
-        s.batchPhotos.push(fileId);
       }
       return bot.sendMessage(chatId, `✅ Фото ${s.batchPhotos.length}/500 добавлено.`, {
         reply_markup: { inline_keyboard: [[{ text: "📦 Меню пакета", callback_data: "do_batch_menu" }]] }
