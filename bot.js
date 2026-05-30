@@ -1,4 +1,5 @@
 const TelegramBot = require("node-telegram-bot-api");
+const crypto = require("crypto");
 const axios = require("axios");
 const fs = require("fs");
 const FormData = require("form-data");
@@ -25,65 +26,41 @@ function saveJSON(file, data) {
 const persistedStates = loadJSON(STATE_FILE, {});
 const persistedHistory = loadJSON(HISTORY_FILE, {});
 
-// ─── Менеджер упорядоченной отправки результатов ──────────────
-class OrderedSender {
-  constructor(chatId, total) {
-    this.chatId = chatId;
-    this.total = total;
-    this.results = new Map(); // orderIndex -> result
-    this.nextToSend = 1;
-    this.lock = false;
-  }
-
-  // Добавить результат и отправить если готов
-  async addResult(orderIndex, sendFn) {
-    this.results.set(orderIndex, sendFn);
-    await this.flushReady();
-  }
-
-  // Отправить все готовые результаты по порядку
-  async flushReady() {
-    if (this.lock) return;
-    this.lock = true;
-
-    try {
-      while (this.results.has(this.nextToSend)) {
-        const sendFn = this.results.get(this.nextToSend);
-        this.results.delete(this.nextToSend);
-        await sendFn(this.nextToSend);
-        this.nextToSend++;
-      }
-    } finally {
-      this.lock = false;
-    }
-  }
-}
-
-// ─── Очередь с 10 параллельными потоками ──────────────────────────────
+// ─── Очередь ──────────────────────────────
 function createQueue(concurrency) {
   let running = 0;
   const queue = [];
-
   function next() {
     while (running < concurrency && queue.length > 0) {
       const { fn, resolve, reject } = queue.shift();
       running++;
-      fn()
-        .then(v => { running--; resolve(v); next(); })
-        .catch(e => { running--; reject(e); next(); });
+      fn().then(v => { running--; resolve(v); next(); })
+          .catch(e => { running--; reject(e); next(); });
     }
   }
-
   return function enqueue(fn) {
-    return new Promise((resolve, reject) => {
-      queue.push({ fn, resolve, reject });
-      next();
-    });
+    return new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
   };
 }
 
 const imageQueue = createQueue(10);
 const videoQueue = createQueue(10);
+// Отдельная очередь отправки в Telegram (2 потока) — защита от flood
+const tgSendQueue = createQueue(2);
+
+// ─── Кэш референсов (fileId → dataUri, TTL 30 мин) ──────────────
+const refCache = new Map();
+const REF_CACHE_TTL = 30 * 60 * 1000;
+
+function refCacheGet(fileId) {
+  const entry = refCache.get(fileId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > REF_CACHE_TTL) { refCache.delete(fileId); return null; }
+  return entry.value;
+}
+function refCacheSet(fileId, value) {
+  refCache.set(fileId, { value, ts: Date.now() });
+}
 
 // ─── Storage upload ───────────────────────
 async function uploadToStorage(buffer, filename = "image.jpg") {
@@ -97,13 +74,25 @@ async function uploadToStorage(buffer, filename = "image.jpg") {
   return `file:${data.file_hash}`;
 }
 
-// ─── Загрузить фото из Telegram → base64 data URI ──
+// ─── Загрузить фото из Telegram → base64 data URI (с кэшем) ──
 async function tgPhotoToDataUri(fileId) {
+  const cached = refCacheGet(fileId);
+  if (cached) return cached;
   const f = await bot.getFile(fileId);
   const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
   const ext = f.file_path.split(".").pop().toLowerCase();
   const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
-  return `data:${mime};base64,${Buffer.from(resp.data).toString("base64")}`;
+  const result = `data:${mime};base64,${Buffer.from(resp.data).toString("base64")}`;
+  refCacheSet(fileId, result);
+  return result;
+}
+
+// ─── Загрузить фото из Telegram → storage ref ──
+async function tgPhotoToRef(fileId) {
+  const f = await bot.getFile(fileId);
+  const resp = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.file_path}`, { responseType: "arraybuffer" });
+  const buf = Buffer.from(resp.data);
+  return uploadToStorage(buf);
 }
 
 // ─── V5 API helpers ───────────────────────
@@ -118,8 +107,17 @@ async function v5Create(body) {
   return data;
 }
 
+// ─── Watchdog: убивает задачу если она зависла дольше WATCHDOG_MS ──
+const WATCHDOG_MS = 12 * 60 * 1000; // 12 минут
+
 async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
+  const deadline = Date.now() + WATCHDOG_MS;
   for (let i = 0; i < maxAttempts; i++) {
+    // Watchdog: если вышли за дедлайн — считаем задачу зависшей
+    if (Date.now() > deadline) {
+      console.warn(`[watchdog] genId=${genId} exceeded ${WATCHDOG_MS/1000}s, aborting poll`);
+      throw new Error(`Generation watchdog timeout (${WATCHDOG_MS/1000}s)|REFUNDED:false`);
+    }
     await new Promise(r => setTimeout(r, interval));
     let data;
     try {
@@ -144,6 +142,10 @@ async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
 }
 
 async function sendV5Media(chatId, media, caption, replyMarkup = null) {
+  return tgSendQueue(() => _sendV5MediaImpl(chatId, media, caption, replyMarkup));
+}
+
+async function _sendV5MediaImpl(chatId, media, caption, replyMarkup = null) {
   const isImage = media.mediaType === "image";
   const opts = { caption, parse_mode: "Markdown", ...(replyMarkup && { reply_markup: replyMarkup }) };
 
@@ -160,7 +162,8 @@ async function sendV5Media(chatId, media, caption, replyMarkup = null) {
     b64 = parts[1];
     if (parts[0].includes("png")) ext = "png";
   }
-  const tmp = `/tmp/fg_${Date.now()}.${ext}`;
+  // UUID для уникальных временных файлов — исключает коллизии при параллельных задачах
+  const tmp = `/tmp/fg_${crypto.randomUUID()}.${ext}`;
   fs.writeFileSync(tmp, Buffer.from(b64, "base64"));
   try {
     if (isImage) await bot.sendPhoto(chatId, fs.createReadStream(tmp), opts);
@@ -195,6 +198,7 @@ const HOURLY_LIMITS = { images: 500, videos: 15, tokens: 200000 };
 
 function nextHourResetUTC() {
   const now = new Date();
+  // Сброс в начале каждого часа по UTC (00:00, 01:00, 02:00, ...)
   const nextHour = new Date(Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth(),
@@ -648,7 +652,7 @@ function showBatchMenu(chatId, msgId = null) {
   ] : [];
 
   const kb = { inline_keyboard: [
-    [{ text: `${typeIcon} Сменить тип", callback_data: "batch_change_type" }, { text: "⚙️ Настройки", callback_data: "batch_settings" }],
+    [{ text: `${typeIcon} Сменить тип`, callback_data: "batch_change_type" }, { text: "⚙️ Настройки", callback_data: "batch_settings" }],
     ...(navRow.length ? [navRow] : []),
     [{ text: "✏️ Добавить промпты", callback_data: "batch_add_text" }, { text: "📄 Из .txt файла", callback_data: "batch_from_file" }],
     ...(isVideoImage ? [[{ text: "📸 Фото", callback_data: "batch_photos_menu" }]] : []),
@@ -890,16 +894,13 @@ async function scheduleVideoChunk(chatId) {
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
   }
 
-  // Для почасового планировщика тоже используем OrderedSender
-  const sender = new OrderedSender(chatId, chunk.length);
-  let completedInChunk = 0;
-  let chunkErrors = 0;
-
   for (const task of chunk) {
     if (job.stopped) break;
 
+    // Проверяем: до следующего часа UTC осталось меньше 5 минут?
     const timeUntilNextHour = getTimeUntilNextHourUTC();
     if (timeUntilNextHour < 5 * 60 * 1000) {
+      // Не перегенерируем — сохраняем задачу
       const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       storeFailedTask(chatId, errKey, {
         prompt: task.prompt,
@@ -911,42 +912,24 @@ async function scheduleVideoChunk(chatId) {
         grokDuration: batchS.grokDuration,
         imageRef: task.imageRef,
         seed: batchS.seed,
-        orderIndex: task.orderIndex,
-        totalTasks: task.totalTasks,
       });
       await bot.sendMessage(chatId,
-        `⚠️ Осталось <5 минут до конца часа. Задача ${task.orderIndex} отложена для ручной перегенерации.`,
+        `⚠️ Осталось <5 минут до конца часа. Задача ${task.idx} отложена для ручной перегенерации.`,
         { parse_mode: "Markdown",
           reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
         });
       job.errorsSoFar++;
-      chunkErrors++;
       continue;
     }
 
     try {
-      await genOneWithSender(chatId, batchS, task.prompt, task.operation, model, false, task.orderIndex, task.totalTasks, task.imageRef, true, sender);
-      completedInChunk++;
+      await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
+      job.doneSoFar++;
     } catch {
-      chunkErrors++;
       job.errorsSoFar++;
     }
-
-    // Обновляем прогресс
-    const progress = `⏰ *Почасовой пакет (видео)*\n` +
-      `🤖 ${model.label}\n` +
-      `Всего: ${total} | Осталось: ${job.tasks.length}\n` +
-      `✓${job.doneSoFar + completedInChunk} ✗${job.errorsSoFar}\n` +
-      `Текущая пачка: ${completedInChunk}/${chunk.length}`;
-
-    await bot.editMessageText(progress, {
-      chat_id: chatId,
-      message_id: job.statusMsgId,
-      parse_mode: "Markdown"
-    }).catch(() => {});
+    await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
   }
-
-  job.doneSoFar += completedInChunk;
 
   if (job.stopped) {
     delete videoScheduler[chatId];
@@ -973,8 +956,9 @@ async function scheduleVideoChunk(chatId) {
   }
 }
 
-// ─── Генерация с упорядоченной отправкой (v5) с автоперегенерацией до 5 раз ──────────
-async function genOneWithSender(chatId, s, prompt, operation, model, isImage, orderIndex, totalTasks, imageRef, isScheduled, sender) {
+// ─── Генерация одной задачи (v5) с автоперегенерацией до 5 раз ──────────
+async function genOne(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null, isScheduled = false) {
+  const label = batchIdx || (total > 1 ? `${index}/${total}` : "");
   const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const MAX_RETRIES = 5;
 
@@ -993,7 +977,7 @@ async function genOneWithSender(chatId, s, prompt, operation, model, isImage, or
     body.inputs = refs;
   }
 
-  console.log(`[genOneWithSender] operation=${operation} order=${orderIndex}/${totalTasks} bodyKeys=${Object.keys(body).join(",")}`);
+  console.log(`[genOne] operation=${operation} label=${label} bodyKeys=${Object.keys(body).join(",")}`);
 
   const taskData = {
     prompt, operation, model,
@@ -1002,7 +986,6 @@ async function genOneWithSender(chatId, s, prompt, operation, model, isImage, or
     grokDuration: s.grokDuration || "6s",
     imageRef: imageRef || null,
     seed: s.seed,
-    orderIndex, totalTasks,
   };
 
   let lastError = null;
@@ -1018,28 +1001,26 @@ async function genOneWithSender(chatId, s, prompt, operation, model, isImage, or
       const detail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
       const status = e.response?.status ? `[HTTP ${e.response.status}] ` : "";
       const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
-      console.error(`[genOneWithSender] create failed (retry ${retry + 1}/${MAX_RETRIES}): ${status}${errStr}`);
+      console.error(`[genOne] create failed (retry ${retry + 1}/${MAX_RETRIES}): ${status}${errStr}`);
 
       lastError = new Error(`${status}${errStr}`);
       lastRefunded = false;
 
+      // Если до следующего часа UTC осталось меньше 5 минут — прекращаем перегенерацию
       if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
         storeFailedTask(chatId, errKey, taskData);
-
-        // Добавляем в sender для сохранения порядка
-        await sender.addResult(orderIndex, async (idx) => {
-          await bot.sendMessage(chatId,
-            `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry} попыток.\n` +
-            `❌ *Ошибка создания задачи* [№${idx}/${totalTasks}]\n` +
-            `🤖 ${model.label}\n${status}${errStr.slice(0, 400)}`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-            });
-        });
+        await bot.sendMessage(chatId,
+          `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry} попыток.\n` +
+          `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
+          `🤖 ${model.label}\n${status}${errStr.slice(0, 400)}`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+          });
         throw lastError;
       }
 
+      // Иначе продолжаем retry
       continue;
     }
 
@@ -1051,6 +1032,7 @@ async function genOneWithSender(chatId, s, prompt, operation, model, isImage, or
       results = pollResult.results;
       const usage = pollResult.usage;
 
+      // Успех! Тратим баланс (только если refunded=false или нет данных)
       if (!usage || usage.refunded !== true) {
         if (isImage) spendBalance("images", 1);
         else {
@@ -1059,73 +1041,68 @@ async function genOneWithSender(chatId, s, prompt, operation, model, isImage, or
         }
       }
 
-      // Добавляем результат в упорядоченный отправитель
-      await sender.addResult(orderIndex, async (idx) => {
-        const idxStr = `*${idx}/${totalTasks}* `;
-        const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
-        const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
+      const idxStr = batchIdx ? `*${batchIdx}* ` : "";
+      const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
+      const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
 
-        try {
-          for (const item of results) {
-            let media;
-            if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
-            else if (item.download_path) {
-              const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
-              media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
-            }
-            if (media) await sendV5Media(chatId, media, caption, regenKb);
+      try {
+        for (const item of results) {
+          let media;
+          if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
+          else if (item.download_path) {
+            const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
+            media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
           }
-        } catch(e) {
-          console.error(`[genOneWithSender] sendMedia failed genId=${genId}: ${e.message}`);
-          await bot.sendMessage(chatId,
-            `⚠️ Генерация завершена, но отправка файла не удалась\n${e.message.slice(0, 300)}`,
-            { parse_mode: "Markdown" }
-          );
+          if (media) await sendV5Media(chatId, media, caption, regenKb);
         }
-      });
+      } catch(e) {
+        console.error(`[genOne] sendMedia failed genId=${genId}: ${e.message}`);
+        await bot.sendMessage(chatId,
+          `⚠️ Генерация завершена, но отправка файла не удалась\n${e.message.slice(0, 300)}`,
+          { parse_mode: "Markdown" }
+        );
+      }
 
-      return;
+      return; // Успешное завершение
     } catch(e) {
-      console.error(`[genOneWithSender] poll failed genId=${genId} (retry ${retry + 1}/${MAX_RETRIES}): ${e.message}`);
+      console.error(`[genOne] poll failed genId=${genId} (retry ${retry + 1}/${MAX_RETRIES}): ${e.message}`);
 
+      // Парсим refunded из ошибки
       const errMsg = e.message || "";
       const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
       lastRefunded = refundedMatch ? refundedMatch[1] === "true" : false;
       lastError = new Error(errMsg.replace(/\|REFUNDED:(true|false)/, ""));
 
+      // Если до следующего часа UTC осталось меньше 5 минут — прекращаем перегенерацию
       if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
         storeFailedTask(chatId, errKey, taskData);
-
-        await sender.addResult(orderIndex, async (idx) => {
-          await bot.sendMessage(chatId,
-            `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry + 1} попыток.\n` +
-            `❌ *Ошибка генерации* [№${idx}/${totalTasks}]\n🤖 ${model.label}\n${lastError.message.slice(0, 400)}\n` +
-            `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-            });
-        });
+        await bot.sendMessage(chatId,
+          `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry + 1} попыток.\n` +
+          `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${lastError.message.slice(0, 400)}\n` +
+          `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+          });
         throw lastError;
       }
 
+      // Иначе продолжаем retry
       continue;
     }
   }
 
+  // Все 5 попыток исчерпаны
   storeFailedTask(chatId, errKey, taskData);
-
-  await sender.addResult(orderIndex, async (idx) => {
-    await bot.sendMessage(chatId,
-      `❌ *Ошибка после ${MAX_RETRIES} попыток перегенерации* [№${idx}/${totalTasks}]\n` +
-      `🤖 ${model.label}\n` +
-      `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
-      `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
-      {
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-      });
-  });
+  await bot.sendMessage(chatId,
+    `❌ *Ошибка после ${MAX_RETRIES} попыток перегенерации*${label ? ` [${label}]` : ""}\n` +
+    `🤖 ${model.label}\n` +
+    `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
+    `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
+    });
   throw lastError || new Error("Max retries exceeded");
 }
 
@@ -1136,7 +1113,7 @@ async function retryFailedTask(chatId, errKey) {
     return bot.sendMessage(chatId, "❌ Задача не найдена (возможно устарела, прошло >24ч).");
   }
 
-  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed, orderIndex, totalTasks } = task;
+  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed } = task;
 
   const fakeS = {
     ratio,
@@ -1147,15 +1124,12 @@ async function retryFailedTask(chatId, errKey) {
   };
 
   const statusMsg = await bot.sendMessage(chatId,
-    `🔄 *Перегенерирую задачу...*${orderIndex ? ` [№${orderIndex}/${totalTasks}]` : ""}\n🤖 ${model.label}\n📝 _${prompt.slice(0, 80)}_`,
+    `🔄 *Перегенерирую задачу...*\n🤖 ${model.label}\n📝 _${prompt.slice(0, 80)}_`,
     { parse_mode: "Markdown" }
   );
 
-  // Простой sender для перегенерации
-  const sender = new OrderedSender(chatId, 1);
-
   try {
-    await genOneWithSender(chatId, fakeS, prompt, operation, model, isImage, orderIndex || 1, totalTasks || 1, imageRef, false, sender);
+    await genOne(chatId, fakeS, prompt, operation, model, isImage, 0, 0, null, imageRef, false);
     await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
     failedTasks.delete(`${chatId}_${errKey}`);
   } catch(e) {
@@ -1192,6 +1166,7 @@ async function handlePromptAndGenerate(chatId, s, rawPrompt, generatorFn) {
     return generatorFn(rawPrompt);
   }
 
+  // ask
   const previewMsg = await bot.sendMessage(chatId,
     `✨ *Улучшить промпт?*\n\n📝 _${rawPrompt.slice(0, 200)}${rawPrompt.length > 200 ? "..." : ""}_`,
     { parse_mode: "Markdown", reply_markup: { inline_keyboard: [
@@ -1230,37 +1205,61 @@ async function runNormal(chatId, s, prompt) {
   const doGenerate = async (finalPrompt) => {
     const count = s.count;
     const queue = isImage ? imageQueue : videoQueue;
-
+    let done = 0, errors = 0;
     const statusMsg = await bot.sendMessage(chatId,
-      `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно, результаты по порядку)`,
+      `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
       { parse_mode: "Markdown" });
 
-    // Создаем упорядоченный отправитель
-    const sender = new OrderedSender(chatId, count);
-    let completed = 0;
-    let errors = 0;
-
-    const tasks = Array.from({ length: count }, (_, i) => {
-      const orderIndex = i + 1;
-      return queue(() => genOneWithSender(chatId, s, finalPrompt, operation, model, isImage, orderIndex, count, null, false, sender))
-        .then(() => {
-          completed++;
-        })
-        .catch(() => {
-          errors++;
-        })
-        .finally(() => {
+    if (isImage && count > 1) {
+      // Упорядоченная отправка для нескольких изображений из одного промпта
+      const resultSlots = Array.from({ length: count }, () => {
+        let resolve, reject;
+        const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+        return { promise: p, resolve, reject };
+      });
+      // Запускаем все генерации параллельно
+      for (let i = 0; i < count; i++) {
+        const slot = resultSlots[i];
+        queue(() => genOneRaw(chatId, s, finalPrompt, operation, model, isImage, i + 1, count))
+          .then(r => slot.resolve(r))
+          .catch(e => slot.reject(e));
+      }
+      // Отправляем строго по порядку
+      let sendChain = Promise.resolve();
+      for (let i = 0; i < count; i++) {
+        const slot = resultSlots[i];
+        sendChain = sendChain.then(async () => {
+          try {
+            const result = await slot.promise;
+            await sendBatchResult(chatId, result, `${i + 1}/${count}`, model);
+            done++;
+          } catch(e) {
+            errors++;
+          }
           bot.editMessageText(
-            `⏳ Прогресс: ✓${completed}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
+            `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
             { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
           ).catch(() => {});
         });
-    });
-
-    await Promise.allSettled(tasks);
+      }
+      await sendChain;
+    } else {
+      const tasks = Array.from({ length: count }, (_, i) =>
+        queue(() => genOne(chatId, s, finalPrompt, operation, model, isImage, i + 1, count))
+          .then(() => done++)
+          .catch(() => errors++)
+          .finally(() => {
+            bot.editMessageText(
+              `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
+              { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+            ).catch(() => {});
+          })
+      );
+      await Promise.allSettled(tasks);
+    }
 
     await bot.editMessageText(
-      `✅ Готово! ✓${completed}${errors > 0 ? ` ✗${errors}` : ""}`,
+      `✅ Готово! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
       { chat_id: chatId, message_id: statusMsg.message_id }
     ).catch(() => {});
     showMainMenu(chatId);
@@ -1293,6 +1292,7 @@ async function runKeyframes(chatId, s, prompt) {
       const created = await v5Create(body);
       const pollResult = await v5Poll(created.id);
 
+      // Проверяем refunded
       if (!pollResult.usage || pollResult.usage.refunded !== true) {
         spendBalance("videos", 1);
       }
@@ -1316,7 +1316,114 @@ async function runKeyframes(chatId, s, prompt) {
   await handlePromptAndGenerate(chatId, s, prompt, doGenerate);
 }
 
-// ─── runBatch с упорядоченной отправкой ─────────────────────────────
+// ─── genOneRaw: генерирует но НЕ отправляет, возвращает результат ──────
+// Используется для упорядоченной отправки в пакетном режиме фото
+async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, total, batchIdx = null, imageRef = null, isScheduled = false) {
+  const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const MAX_RETRIES = 5;
+
+  const body = {
+    operation,
+    prompt,
+    aspect_ratio: s.ratio,
+    ...(s.seed === "fixed" && { seed: 42 }),
+    ...(model.quality && { quality: model.quality }),
+    ...(model.hasResolution && { resolution: s.resolution || "720p" }),
+    ...(model.hasDuration && s.grokDuration && { duration: s.grokDuration }),
+  };
+
+  const refs = imageRef ? [imageRef] : (s.pendingRefImages && s.pendingRefImages.length > 0 ? s.pendingRefImages : null);
+  if (refs && refs.length > 0) body.inputs = refs;
+
+  const taskData = {
+    prompt, operation, model,
+    isImage, ratio: s.ratio,
+    resolution: s.resolution || "720p",
+    grokDuration: s.grokDuration || "6s",
+    imageRef: imageRef || null,
+    seed: s.seed,
+  };
+
+  let lastError = null;
+  let lastRefunded = false;
+
+  for (let retry = 0; retry < MAX_RETRIES; retry++) {
+    let genId;
+    try {
+      const created = await v5Create(body);
+      genId = created.id;
+      if (!genId) throw new Error(`v5Create returned no id: ${JSON.stringify(created).slice(0, 200)}`);
+    } catch(e) {
+      const detail = e.response?.data?.detail || e.response?.data?.message || e.response?.data?.error || e.message;
+      const status = e.response?.status ? `[HTTP ${e.response.status}] ` : "";
+      const errStr = typeof detail === "object" ? JSON.stringify(detail) : String(detail);
+      lastError = new Error(`${status}${errStr}`);
+      lastRefunded = false;
+      if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
+        storeFailedTask(chatId, errKey, taskData);
+        throw lastError;
+      }
+      continue;
+    }
+
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio });
+
+    try {
+      const pollResult = await v5Poll(genId);
+      if (!pollResult.usage || pollResult.usage.refunded !== true) {
+        if (isImage) spendBalance("images", 1);
+        else {
+          const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
+          spendBalance("videos", vidCost);
+        }
+      }
+      // Возвращаем данные для отправки — НЕ отправляем здесь
+      return { results: pollResult.results, prompt, model, batchIdx };
+    } catch(e) {
+      const errMsg = e.message || "";
+      const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
+      lastRefunded = refundedMatch ? refundedMatch[1] === "true" : false;
+      lastError = new Error(errMsg.replace(/\|REFUNDED:(true|false)/, ""));
+      if (isScheduled && getTimeUntilNextHourUTC() < 5 * 60 * 1000) {
+        storeFailedTask(chatId, errKey, taskData);
+        throw lastError;
+      }
+      continue;
+    }
+  }
+
+  // Все 5 попыток исчерпаны — пропускаем задачу, не блокируем пакет
+  storeFailedTask(chatId, errKey, taskData);
+  const failMsg =
+    `❌ *Пропущена задача ${batchIdx || ""}* (5 попыток)\n` +
+    `🤖 ${model.label}\n` +
+    `${lastError?.message?.slice(0, 300) || "Неизвестная ошибка"}\n` +
+    `💳 ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`;
+  bot.sendMessage(chatId, failMsg, {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: `retry_err_${errKey}` }]] }
+  }).catch(() => {});
+  throw lastError || new Error("Max retries exceeded");
+}
+
+// ─── sendBatchResult: отправляет результат genOneRaw в правильном порядке ──
+async function sendBatchResult(chatId, result, batchIdx, model) {
+  const { results, prompt } = result;
+  const idxStr = batchIdx ? `*${batchIdx}* ` : "";
+  const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
+  const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
+  for (const item of results) {
+    let media;
+    if (item.data) media = { type: "data_uri", value: item.data, mediaType: item.type };
+    else if (item.download_path) {
+      const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
+      media = { type: "url", value: url, mediaType: item.type || "image" };
+    }
+    if (media) await sendV5Media(chatId, media, caption, regenKb);
+  }
+}
+
+// ─── runBatch ─────────────────────────────
 async function runBatch(chatId) {
   const s = getState(chatId);
   const { bt, isImage, model, ratio, resolution, grokDuration, vidModelKey } = batchEffective(s);
@@ -1329,7 +1436,6 @@ async function runBatch(chatId) {
   if (prompts.length === 0 && photos.length === 0) return bot.sendMessage(chatId, "❌ Нет промптов или фото!");
   if (isVideoImage && photos.length === 0) return bot.sendMessage(chatId, "❌ Добавь фото для режима «Видео из фото»!");
 
-  // Подготовка референсов для видео из фото
   let photoRefs = [];
   if (isVideoImage && photos.length > 0) {
     const uploadMsg = await bot.sendMessage(chatId, `⏳ Подготавливаю ${photos.length} фото...`);
@@ -1352,66 +1458,30 @@ async function runBatch(chatId) {
     }
   }
 
-  // Создание задач с порядковым номером
   const tasks = [];
-  let taskCounter = 0;
-
   if (isVideoImage) {
     for (let fi = 0; fi < photos.length; fi++) {
       const prompt = prompts[fi] || prompts[0] || "animate";
       const op = model.opImg || model.opText;
-      for (let vi = 0; vi < perPrompt; vi++) {
-        taskCounter++;
-        tasks.push({
-          prompt,
-          idx: `ф${fi + 1}.${vi + 1}`,
-          orderIndex: taskCounter,
-          operation: op,
-          imageRef: photoRefs[fi],
-          model
-        });
-      }
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt, idx: `ф${fi + 1}.${vi + 1}`, operation: op, imageRef: photoRefs[fi], model });
     }
-    for (let pi = photos.length; pi < prompts.length; pi++) {
-      for (let vi = 0; vi < perPrompt; vi++) {
-        taskCounter++;
-        tasks.push({
-          prompt: prompts[pi],
-          idx: `т${pi + 1}.${vi + 1}`,
-          orderIndex: taskCounter,
-          operation: model.opText,
-          imageRef: null,
-          model
-        });
-      }
-    }
+    for (let pi = photos.length; pi < prompts.length; pi++)
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt: prompts[pi], idx: `т${pi + 1}.${vi + 1}`, operation: model.opText, imageRef: null, model });
   } else {
     const op = isImage ? model.operation : model.opText;
-    for (let pi = 0; pi < prompts.length; pi++) {
-      for (let vi = 0; vi < perPrompt; vi++) {
-        taskCounter++;
-        tasks.push({
-          prompt: prompts[pi],
-          idx: `${pi + 1}.${vi + 1}`,
-          orderIndex: taskCounter,
-          operation: op,
-          imageRef: null,
-          model
-        });
-      }
-    }
+    for (let pi = 0; pi < prompts.length; pi++)
+      for (let vi = 0; vi < perPrompt; vi++)
+        tasks.push({ prompt: prompts[pi], idx: `${pi + 1}.${vi + 1}`, operation: op, imageRef: null, model });
   }
 
   const total = tasks.length;
   const hourlyLimit = s.batchHourlyLimit || 15;
 
-  // Для видео: почасовой планировщик
   if (!isImage && total > hourlyLimit) {
     videoScheduler[chatId] = {
-      tasks: tasks.map(t => ({
-        ...t,
-        totalTasks: total
-      })),
+      tasks: [...tasks],
       totalTasks: total,
       doneSoFar: 0,
       errorsSoFar: 0,
@@ -1425,50 +1495,77 @@ async function runBatch(chatId) {
       `⏰ *Почасовой видео-пакет запущен!*\n` +
       `Всего задач: *${total}*\nЛимит/час: *${hourlyLimit}*\n` +
       `Пачек: *${Math.ceil(total / hourlyLimit)}*\n\n` +
-      `Первая пачка стартует сейчас.\n` +
-      `⚡ Результаты придут по порядку: 1, 2, 3...`,
+      `Первая пачка стартует сейчас.`,
       { parse_mode: "Markdown" });
     s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
     scheduleVideoChunk(chatId);
     return;
   }
 
-  // Обычный пакетный режим с 10 потоками
   const queue = isImage ? imageQueue : videoQueue;
-  let completed = 0;
-  let errors = 0;
-
+  let done = 0, errors = 0;
   const statusMsg = await bot.sendMessage(chatId,
-    `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}\n⚡ 10 потоков\n📊 Результаты по порядку: 1→${total}`,
+    `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
 
-  // Создаем упорядоченный отправитель
-  const sender = new OrderedSender(chatId, total);
+  if (isImage) {
+    // ─── Упорядоченная отправка для фото ──────────────────────────────
+    // Каждая задача получает слот-промис. Задача i не отправляется,
+    // пока не завершились задачи 0…i-1. Генерация параллельная (10 потоков),
+    // отправка строго по порядку.
+    const resultSlots = tasks.map(() => {
+      let resolve, reject;
+      const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise: p, resolve, reject };
+    });
 
-  // Запускаем все задачи через очередь (10 параллельно)
-  const allTasks = tasks.map(task =>
-    queue(() => genOneWithSender(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, task.orderIndex, total, task.imageRef || null, false, sender))
-      .then(() => {
-        completed++;
-      })
-      .catch(() => {
-        errors++;
-      })
-      .finally(() => {
+    // Цепочка упорядоченной отправки: каждый слот ждёт предыдущий
+    let sendChain = Promise.resolve();
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
+      const slot = resultSlots[i];
+      // Запускаем генерацию через очередь (параллельно)
+      queue(() => genOneRaw(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
+        .then(result => slot.resolve(result))
+        .catch(err => slot.reject(err));
+      // Добавляем в цепочку отправки
+      const idx = i;
+      sendChain = sendChain.then(async () => {
+        try {
+          const result = await slot.promise;
+          await sendBatchResult(chatId, result, task.idx, model);
+          done++;
+        } catch(e) {
+          errors++;
+          console.error(`[batch ordered] task ${idx} failed: ${e.message}`);
+        }
         bot.editMessageText(
-          `📦 Пакет: ✓${completed}/${total}${errors > 0 ? ` ✗${errors}` : ""}\n⚡ 10 потоков`,
+          `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
           { chat_id: chatId, message_id: statusMsg.message_id }
         ).catch(() => {});
-      })
-  );
-
-  await Promise.allSettled(allTasks);
+      });
+    }
+    await sendChain;
+  } else {
+    // Видео: порядок не важен, отправляем как придёт
+    const allTasks = tasks.map(task =>
+      queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
+        .then(() => done++)
+        .catch(() => errors++)
+        .finally(() => {
+          bot.editMessageText(
+            `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
+            { chat_id: chatId, message_id: statusMsg.message_id }
+          ).catch(() => {});
+        })
+    );
+    await Promise.allSettled(allTasks);
+  }
 
   await bot.editMessageText(
-    `✅ Пакет готов! ✓${completed}${errors > 0 ? ` ✗${errors}` : ""}`,
+    `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
     { chat_id: chatId, message_id: statusMsg.message_id }
   ).catch(() => {});
-
   s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
   showMainMenu(chatId);
 }
@@ -1485,6 +1582,7 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
     const created = await v5Create(body);
     const pollResult = await v5Poll(created.id);
 
+    // Проверяем refunded
     if (!pollResult.usage || pollResult.usage.refunded !== true) {
       if (isImage) spendBalance("images", 1); else spendBalance("videos", 1);
     }
@@ -2085,4 +2183,4 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
   await checkGeneration(msg.chat.id, match[1].trim());
 });
 
-console.log("🤖 FastGen Bot v5 запущен с упорядоченной отправкой результатов!");
+console.log("🤖 FastGen Bot v5 запущен!");
