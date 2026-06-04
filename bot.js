@@ -52,6 +52,7 @@ const BALANCE_FILE = "./balance_state.json";
 const HISTORY_FILE = "./history_state.json";
 const VIDEO_PROJECTS_FILE = "./video_projects.json";
 const VIDEO_PROJECT_HISTORY_FILE = "./video_project_history.json";
+const VIDEO_REF_PRESETS_FILE = "./video_ref_presets.json";
 
 function loadJSON(file, def) {
   try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return def; }
@@ -64,6 +65,7 @@ const persistedStates = loadJSON(STATE_FILE, {});
 const persistedHistory = loadJSON(HISTORY_FILE, {});
 const videoProjects = loadJSON(VIDEO_PROJECTS_FILE, {});
 const videoProjectHistory = loadJSON(VIDEO_PROJECT_HISTORY_FILE, {});
+const videoRefPresets = loadJSON(VIDEO_REF_PRESETS_FILE, {});
 
 // ─── Очередь ──────────────────────────────
 function createQueue(concurrency) {
@@ -485,12 +487,26 @@ const VIDEO_PROJECT_MAX_RETRIES = 5;
 const VIDEO_PROJECT_PROCESS_MS = 60 * 1000;
 let videoProjectsProcessorBusy = false;
 
+// Встроенные наборы подписей refs. Пользовательские пресеты хранятся в video_ref_presets.json.
+const VIDEO_PROJECT_BUILTIN_REF_PRESETS = [
+  { id: "char", name: "👤 Character", labels: ["hero", "face", "outfit", "pose", "background", "lighting", "style"] },
+  { id: "scene", name: "🏙 Scene", labels: ["location", "hero", "main_object", "weather", "camera", "lighting", "style"] },
+  { id: "product", name: "📦 Product Ad", labels: ["product", "logo", "hand", "background", "lighting", "camera", "style"] },
+  { id: "fashion", name: "👕 Fashion", labels: ["model", "outfit", "shoes", "accessory", "location", "pose", "lighting"] },
+  { id: "vehicle", name: "🚗 Vehicle", labels: ["vehicle", "driver", "road", "city", "camera", "lighting", "style"] },
+  { id: "story", name: "🎞 Story", labels: ["character", "second_character", "location", "prop", "mood", "camera", "style"] },
+];
+
 function saveVideoProjects() {
   saveJSON(VIDEO_PROJECTS_FILE, videoProjects);
 }
 
 function saveVideoProjectHistory() {
   saveJSON(VIDEO_PROJECT_HISTORY_FILE, videoProjectHistory);
+}
+
+function saveVideoRefPresets() {
+  saveJSON(VIDEO_REF_PRESETS_FILE, videoRefPresets);
 }
 
 function shortId(prefix = "vp") {
@@ -531,8 +547,13 @@ function normalizeVideoProject(project) {
   project.nextIndex = Number.isInteger(project.nextIndex) ? project.nextIndex : 0;
   project.done = project.done || 0;
   project.failed = project.failed || 0;
-  project.defaultRefs = Array.isArray(project.defaultRefs) ? project.defaultRefs.slice(0, VIDEO_PROJECT_MAX_REFS) : [];
+  project.defaultRefs = normalizeVideoProjectRefs(project.defaultRefs, "project_ref").slice(0, VIDEO_PROJECT_MAX_REFS);
   project.prompts = Array.isArray(project.prompts) ? project.prompts : [];
+  for (const prompt of project.prompts) {
+    prompt.refs = normalizeVideoProjectRefs(prompt.refs, `prompt_${(prompt.index ?? 0) + 1}_ref`).slice(0, VIDEO_PROJECT_MAX_REFS);
+    prompt.status = prompt.status || "pending";
+    prompt.retries = prompt.retries || 0;
+  }
   project.hourlyUsage = project.hourlyUsage || { hourKey: utcHourKey(), used: 0 };
   project.ratio = project.ratio || "16:9";
   project.resolution = project.resolution || "720p";
@@ -600,6 +621,287 @@ function findVideoProjectPrompt(project, promptId) {
   return (project.prompts || []).find(p => p.id === promptId);
 }
 
+function getVideoProjectModelRefLimit(project) {
+  const modelKey = typeof project === "string" ? project : project?.model;
+  const model = VIDEO_MODELS[modelKey];
+  if (!model?.opImg) return 0;
+  // Лимиты по текущим video-моделям FastGen/API:
+  // Flower image-to-video: 1 image; Flow/Veo ingredients: 1-3 images; Grok video: up to 7 images.
+  if (modelKey === "flower_vid") return 1;
+  if (modelKey === "grok_vid") return 7;
+  if (String(model?.opImg || "").includes("ingredients")) return 3;
+  return VIDEO_PROJECT_MAX_REFS;
+}
+
+function getVideoProjectPromptRefLimit(project) {
+  return Math.min(VIDEO_PROJECT_MAX_REFS, getVideoProjectModelRefLimit(project));
+}
+
+function sanitizeVideoProjectRefLabel(label, fallback = "ref") {
+  const raw = String(label || "").trim().replace(/\s+/g, " ");
+  return cut(raw || fallback, 80);
+}
+
+function sanitizeVideoProjectRefFilename(label, index = 0, prefix = "ref") {
+  const raw = String(label || `${prefix}_${index + 1}`)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9а-яё_\-]+/gi, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const base = (raw || `${prefix}_${index + 1}`).slice(0, 80);
+  return base.match(/\.(jpg|jpeg|png|webp)$/i) ? base : `${base}.jpg`;
+}
+
+function normalizeVideoProjectRef(ref, index = 0, prefix = "ref") {
+  if (!ref) return null;
+  if (typeof ref === "string") {
+    const label = sanitizeVideoProjectRefLabel(`${prefix} ${index + 1}`, `${prefix} ${index + 1}`);
+    return {
+      input: ref,
+      label,
+      filename: sanitizeVideoProjectRefFilename(label, index, prefix),
+      createdAt: Date.now(),
+    };
+  }
+  if (typeof ref === "object") {
+    const input = ref.input || ref.value || ref.data || ref.ref || ref.url || ref.file || null;
+    if (!input) return null;
+    const label = sanitizeVideoProjectRefLabel(ref.label || ref.name || ref.title || ref.filename || `${prefix} ${index + 1}`, `${prefix} ${index + 1}`);
+    return {
+      input,
+      label,
+      filename: sanitizeVideoProjectRefFilename(ref.filename || label, index, prefix),
+      createdAt: ref.createdAt || Date.now(),
+    };
+  }
+  return null;
+}
+
+function normalizeVideoProjectRefs(refs, prefix = "ref") {
+  if (!Array.isArray(refs)) return [];
+  return refs.map((ref, i) => normalizeVideoProjectRef(ref, i, prefix)).filter(Boolean);
+}
+
+function makeVideoProjectRef(input, label, index = 0, prefix = "ref") {
+  const cleanLabel = sanitizeVideoProjectRefLabel(label, `${prefix} ${index + 1}`);
+  return {
+    input,
+    label: cleanLabel,
+    filename: sanitizeVideoProjectRefFilename(cleanLabel, index, prefix),
+    createdAt: Date.now(),
+  };
+}
+
+function videoProjectRefInput(ref) {
+  if (!ref) return null;
+  return typeof ref === "string" ? ref : (ref.input || ref.value || ref.data || null);
+}
+
+function videoProjectRefLabel(ref, index = 0, prefix = "ref") {
+  if (!ref || typeof ref === "string") return `${prefix} ${index + 1}`;
+  return sanitizeVideoProjectRefLabel(ref.label || ref.filename, `${prefix} ${index + 1}`);
+}
+
+function videoProjectRefsForApi(refs, prefix = "ref") {
+  return normalizeVideoProjectRefs(refs, prefix)
+    .map((ref, i) => ({
+      filename: sanitizeVideoProjectRefFilename(ref.filename || ref.label, i, prefix),
+      input: videoProjectRefInput(ref),
+    }))
+    .filter(item => item.input);
+}
+
+function videoProjectRefsPromptBlock(refs, prefix = "ref") {
+  const normalized = normalizeVideoProjectRefs(refs, prefix);
+  if (!normalized.length) return "";
+  const lines = normalized.map((ref, i) => {
+    const filename = sanitizeVideoProjectRefFilename(ref.filename || ref.label, i, prefix);
+    const label = videoProjectRefLabel(ref, i, prefix);
+    return `- ${filename}: ${label}`;
+  }).join("\n");
+  return `\n\nReference images available by filename:\n${lines}\nUse these filenames/labels exactly when following the prompt.`;
+}
+
+function formatVideoProjectRefsList(refs, prefix = "ref") {
+  const normalized = normalizeVideoProjectRefs(refs, prefix);
+  if (!normalized.length) return "_Refs нет_";
+  return normalized.map((ref, i) => {
+    const filename = sanitizeVideoProjectRefFilename(ref.filename || ref.label, i, prefix);
+    const label = videoProjectRefLabel(ref, i, prefix);
+    return `${i + 1}. *${md(label)}* → \`${md(filename)}\``;
+  }).join("\n");
+}
+
+function parseVideoProjectRefLabels(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const m = line.match(/^(\d+)\s*[:=\-.]\s*(.+)$/);
+      if (m) return { index: parseInt(m[1], 10) - 1, label: m[2].trim() };
+      return { index: null, label: line };
+    });
+}
+
+function applyVideoProjectRefLabels(refs, labels, prefix = "ref") {
+  const normalized = normalizeVideoProjectRefs(refs, prefix);
+  const sequential = [];
+  for (const item of labels) {
+    if (Number.isInteger(item.index) && item.index >= 0 && item.index < normalized.length) {
+      normalized[item.index].label = sanitizeVideoProjectRefLabel(item.label, `${prefix} ${item.index + 1}`);
+      normalized[item.index].filename = sanitizeVideoProjectRefFilename(normalized[item.index].label, item.index, prefix);
+    } else {
+      sequential.push(item.label);
+    }
+  }
+  for (let i = 0; i < sequential.length && i < normalized.length; i++) {
+    normalized[i].label = sanitizeVideoProjectRefLabel(sequential[i], `${prefix} ${i + 1}`);
+    normalized[i].filename = sanitizeVideoProjectRefFilename(normalized[i].label, i, prefix);
+  }
+  return normalized;
+}
+
+function getVideoProjectPhotoLabel(msg, fallback) {
+  return sanitizeVideoProjectRefLabel(msg.caption || fallback, fallback);
+}
+
+function cloneVideoProjectRefs(refs, prefix = "ref") {
+  return normalizeVideoProjectRefs(refs, prefix).map((ref, i) => ({
+    input: videoProjectRefInput(ref),
+    label: videoProjectRefLabel(ref, i, prefix),
+    filename: sanitizeVideoProjectRefFilename(ref.filename || ref.label, i, prefix),
+    createdAt: Date.now(),
+  })).filter(ref => ref.input);
+}
+
+function getChatRefPresets(chatId) {
+  const key = String(chatId);
+  if (!Array.isArray(videoRefPresets[key])) videoRefPresets[key] = [];
+  return videoRefPresets[key];
+}
+
+function normalizeRefPresetLabels(labels) {
+  return (Array.isArray(labels) ? labels : [])
+    .map((label, i) => sanitizeVideoProjectRefLabel(label, `ref ${i + 1}`))
+    .filter(Boolean)
+    .slice(0, VIDEO_PROJECT_MAX_REFS);
+}
+
+function parseCustomRefPreset(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  let name = "Custom preset";
+  let labelsText = raw;
+  const firstLine = raw.split(/\r?\n/)[0] || "";
+  const colon = firstLine.indexOf(":");
+
+  if (colon > 0) {
+    name = firstLine.slice(0, colon).trim();
+    labelsText = `${firstLine.slice(colon + 1)}\n${raw.split(/\r?\n/).slice(1).join("\n")}`;
+  } else {
+    const lines = raw.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    if (lines.length > 1) {
+      name = lines[0];
+      labelsText = lines.slice(1).join("\n");
+    }
+  }
+
+  const labels = labelsText
+    .split(/[\n,;]+/)
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  const cleanLabels = normalizeRefPresetLabels(labels);
+  if (!cleanLabels.length) return null;
+  return {
+    id: shortId("rps"),
+    name: cut(sanitizeVideoProjectRefLabel(name, "Custom preset"), 40),
+    labels: cleanLabels,
+    createdAt: Date.now(),
+  };
+}
+
+function getVideoProjectPresetById(chatId, type, presetId) {
+  if (type === "builtin") return VIDEO_PROJECT_BUILTIN_REF_PRESETS.find(p => p.id === presetId) || null;
+  return getChatRefPresets(chatId).find(p => p.id === presetId) || null;
+}
+
+function getVideoProjectPresetTarget(chatId) {
+  const s = getState(chatId);
+  const target = s.vpPresetTarget || {};
+  const project = videoProjects[target.projectId];
+  if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") return null;
+  normalizeVideoProject(project);
+  const prompt = target.promptId ? findVideoProjectPrompt(project, target.promptId) : null;
+  if (target.promptId && !prompt) return null;
+  return { project, prompt };
+}
+
+function applyVideoProjectRefPresetToTarget(chatId, preset) {
+  const target = getVideoProjectPresetTarget(chatId);
+  if (!target || !preset) return { ok: false, message: "❌ Target или preset не найден." };
+  const { project, prompt } = target;
+  const labels = normalizeRefPresetLabels(preset.labels);
+  if (!labels.length) return { ok: false, message: "❌ В preset нет labels." };
+
+  if (prompt) {
+    if (!Array.isArray(prompt.refs) || prompt.refs.length === 0) return { ok: false, message: "❌ У этого prompt нет refs. Сначала добавь фото." };
+    prompt.refs = applyVideoProjectRefLabels(prompt.refs, labels.map((label, index) => ({ index, label })), `prompt_${(prompt.index ?? 0) + 1}_ref`);
+    prompt.updatedAt = Date.now();
+    project.updatedAt = Date.now();
+    saveVideoProjects();
+    return { ok: true, message: `✅ Preset применён к prompt #${(prompt.index ?? 0) + 1}: *${md(preset.name)}*` };
+  }
+
+  if (!Array.isArray(project.defaultRefs) || project.defaultRefs.length === 0) return { ok: false, message: "❌ У проекта нет refs. Сначала добавь Project refs." };
+  project.defaultRefs = applyVideoProjectRefLabels(project.defaultRefs, labels.map((label, index) => ({ index, label })), "project_ref");
+  project.updatedAt = Date.now();
+  saveVideoProjects();
+  return { ok: true, message: `✅ Preset применён к Project refs: *${md(preset.name)}*` };
+}
+
+function cloneRefsToVideoProjectPrompts(project, sourceRefs, mode, sourcePrompt = null) {
+  normalizeVideoProject(project);
+  const prompts = [...(project.prompts || [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const cleanSource = normalizeVideoProjectRefs(sourceRefs, "clone_ref").slice(0, getVideoProjectPromptRefLimit(project));
+  if (!cleanSource.length) return 0;
+
+  let targets = prompts;
+  if (sourcePrompt) targets = targets.filter(p => p.id !== sourcePrompt.id);
+  if (mode === "missing") targets = targets.filter(p => !Array.isArray(p.refs) || p.refs.length === 0);
+  if (mode === "next10" && sourcePrompt) {
+    const start = (sourcePrompt.index ?? 0) + 1;
+    targets = targets.filter(p => (p.index ?? 0) >= start).slice(0, 10);
+  }
+
+  let changed = 0;
+  for (const prompt of targets) {
+    prompt.refs = cloneVideoProjectRefs(cleanSource, `prompt_${(prompt.index ?? 0) + 1}_ref`).slice(0, getVideoProjectPromptRefLimit(project));
+    prompt.updatedAt = Date.now();
+    changed++;
+  }
+  if (changed) {
+    project.updatedAt = Date.now();
+    saveVideoProjects();
+  }
+  return changed;
+}
+
+function countVideoProjectPromptRefs(project) {
+  return (project.prompts || []).reduce((sum, p) => sum + (Array.isArray(p.refs) ? p.refs.length : 0), 0);
+}
+
+function getVideoProjectPromptByNumber(project, num) {
+  const idx = Number(num) - 1;
+  if (!Number.isInteger(idx) || idx < 0) return null;
+  const sorted = [...(project.prompts || [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  return sorted[idx] || null;
+}
+
 function addVideoProjectHistory(chatId, entry) {
   const key = String(chatId);
   if (!videoProjectHistory[key]) videoProjectHistory[key] = [];
@@ -625,7 +927,9 @@ function videoProjectStatusText(project) {
     `Remaining: *${remaining}*\n\n` +
     `Progress: *${getProjectProgress(project)}%*\n\n` +
     `Hourly Limit: *${project.hourlyLimit}/hour*\n` +
-    `Refs: *${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}*`
+    `Project refs stored: *${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}*\n` +
+    `Per-prompt usable refs for model: *${getVideoProjectPromptRefLimit(project)}*\n` +
+    `Prompt refs: *${countVideoProjectPromptRefs(project)}*`
   );
 }
 
@@ -711,11 +1015,17 @@ function showVideoProjectEditor(chatId, projectId, msgId = null) {
     `Model: *${md(model?.label || project.model)}*\n` +
     `Hourly Limit: *${project.hourlyLimit}/hour*\n` +
     `Prompts: *${project.prompts.length}*\n` +
-    `Refs: *${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}*\n` +
-    `Progress: *${getProjectProgress(project)}%*`;
+    `Project refs stored: *${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}*\n` +
+    `Refs usable per prompt now: *${getVideoProjectPromptRefLimit(project)}*\n` +
+    `Prompt refs: *${countVideoProjectPromptRefs(project)}*\n` +
+    `Progress: *${getProjectProgress(project)}%*\n\n` +
+    `*Project ref labels:*\n${formatVideoProjectRefsList(project.defaultRefs, "project_ref")}`;
   const kb = { inline_keyboard: [
     [{ text: "📄 Import TXT/DOCX", callback_data: `vp_import_${project.id}` }, { text: "✏️ Paste prompts", callback_data: `vp_paste_${project.id}` }],
-    [{ text: "🖼 Add refs", callback_data: `vp_refs_${project.id}` }, { text: "📊 Project Status", callback_data: `vp_status_${project.id}` }],
+    [{ text: "🖼 Project refs", callback_data: `vp_refs_${project.id}` }, { text: "🧷 Refs per prompt", callback_data: `vp_promptrefs_${project.id}_0` }],
+    [{ text: "🏷 Project presets", callback_data: `vp_presets_${project.id}` }, { text: "🧬 Clone refs", callback_data: `vp_clone_${project.id}` }],
+    ...(project.defaultRefs.length ? [[{ text: "✏️ Rename project refs", callback_data: `vp_refs_rename_${project.id}` }]] : []),
+    [{ text: "📊 Project Status", callback_data: `vp_status_${project.id}` }],
     ...(project.status === "draft" || project.status === "paused" ? [[{ text: "🚀 Start / Resume", callback_data: `vp_start_${project.id}` }]] : []),
     ...(project.status === "running" ? [[{ text: "⏸ Pause", callback_data: `vp_pause_${project.id}` }]] : []),
     [{ text: "🗑 Delete", callback_data: `vp_del_${project.id}` }, { text: "◀️ Back", callback_data: "open_video_projects" }],
@@ -751,6 +1061,164 @@ function showVideoProjectList(chatId, msgId = null, mode = "details") {
   return bot.sendMessage(chatId, title, opts);
 }
 
+
+function showVideoProjectPromptRefsMenu(chatId, projectId, msgId = null, page = 0) {
+  const project = videoProjects[projectId];
+  if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") {
+    return showVideoProjectsMenu(chatId, msgId);
+  }
+  normalizeVideoProject(project);
+  const prompts = [...(project.prompts || [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const PAGE = 8;
+  const totalPages = Math.max(1, Math.ceil(prompts.length / PAGE));
+  const safePage = Math.min(Math.max(parseInt(page) || 0, 0), totalPages - 1);
+  const slice = prompts.slice(safePage * PAGE, safePage * PAGE + PAGE);
+  const limit = getVideoProjectPromptRefLimit(project);
+
+  const text =
+    `🧷 *Refs per prompt*\n\n` +
+    `Project: *${md(project.name)}*\n` +
+    `Prompts: *${prompts.length}*\n` +
+    `Global fallback refs stored: *${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}*\n` +
+    `Refs usable by this model: *${limit}*\n\n` +
+    `Если у prompt есть свои refs, бот использует их. Если нет — использует общие Project refs.`;
+
+  const rows = [];
+  if (prompts.length === 0) {
+    rows.push([{ text: "📄 Import TXT/DOCX", callback_data: `vp_import_${project.id}` }, { text: "✏️ Paste prompts", callback_data: `vp_paste_${project.id}` }]);
+  } else {
+    for (const prompt of slice) {
+      const n = (prompt.index ?? prompts.indexOf(prompt)) + 1;
+      const refCount = Array.isArray(prompt.refs) ? prompt.refs.length : 0;
+      const firstRefLabel = refCount ? ` | ${videoProjectRefLabel(prompt.refs[0], 0, `prompt_${n}_ref`).slice(0, 16)}` : "";
+      rows.push([{ text: `${n}. 🖼 ${refCount}/${limit}${firstRefLabel} | ${cut(prompt.prompt, 28)}`, callback_data: `vp_promptref_${project.id}_${prompt.id}` }]);
+    }
+    const nav = [];
+    if (safePage > 0) nav.push({ text: "◀️", callback_data: `vp_promptrefs_${project.id}_${safePage - 1}` });
+    nav.push({ text: `${safePage + 1}/${totalPages}`, callback_data: "noop" });
+    if (safePage < totalPages - 1) nav.push({ text: "▶️", callback_data: `vp_promptrefs_${project.id}_${safePage + 1}` });
+    rows.push(nav);
+  }
+  rows.push([{ text: "◀️ Project", callback_data: `vp_project_${project.id}` }]);
+
+  const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
+  if (msgId) return bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }).catch(() => {});
+  return bot.sendMessage(chatId, text, opts);
+}
+
+function showVideoProjectPromptRefEditor(chatId, projectId, promptId, msgId = null) {
+  const project = videoProjects[projectId];
+  if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") {
+    return showVideoProjectsMenu(chatId, msgId);
+  }
+  normalizeVideoProject(project);
+  const prompt = findVideoProjectPrompt(project, promptId);
+  if (!prompt) return showVideoProjectPromptRefsMenu(chatId, projectId, msgId, 0);
+
+  const limit = getVideoProjectPromptRefLimit(project);
+  const refs = Array.isArray(prompt.refs) ? prompt.refs : [];
+  const promptNo = (prompt.index ?? 0) + 1;
+  const text =
+    `🧷 *Prompt refs*\n\n` +
+    `Project: *${md(project.name)}*\n` +
+    `Prompt #${promptNo}\n` +
+    `Refs: *${refs.length}/${limit}*\n\n` +
+    `*Ref labels:*\n${formatVideoProjectRefsList(refs, `prompt_${promptNo}_ref`)}\n\n` +
+    `_${md(cut(prompt.prompt, 500))}_\n\n` +
+    `При генерации этот prompt будет использовать свои refs. Если refs очистить, будет использован fallback проекта: ${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}. В prompt можно писать имена refs: например \`${refs[0]?.filename || "character.jpg"}\`.`;
+
+  const kb = { inline_keyboard: [
+    [{ text: "➕ Add refs to this prompt", callback_data: `vp_promptref_add_${project.id}_${prompt.id}` }],
+    [{ text: "🏷 Apply preset", callback_data: `vp_presets_${project.id}_${prompt.id}` }, { text: "🧬 Clone refs", callback_data: `vp_pclone_${project.id}_${prompt.id}` }],
+    ...(refs.length ? [[{ text: "✏️ Rename prompt refs", callback_data: `vp_promptref_rename_${project.id}_${prompt.id}` }]] : []),
+    ...(refs.length ? [[{ text: "🧹 Clear prompt refs", callback_data: `vp_promptref_clear_${project.id}_${prompt.id}` }]] : []),
+    [{ text: "◀️ Refs per prompt", callback_data: `vp_promptrefs_${project.id}_${Math.floor((prompt.index || 0) / 8)}` }],
+  ]};
+
+  if (msgId) return bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(() => {});
+  return bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+
+function showVideoProjectCloneRefsMenu(chatId, projectId, promptId = null, msgId = null) {
+  const project = videoProjects[projectId];
+  if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") return showVideoProjectsMenu(chatId, msgId);
+  normalizeVideoProject(project);
+  const prompt = promptId ? findVideoProjectPrompt(project, promptId) : null;
+  if (promptId && !prompt) return showVideoProjectPromptRefsMenu(chatId, projectId, msgId, 0);
+
+  const sourceRefs = prompt ? (prompt.refs || []) : (project.defaultRefs || []);
+  const promptNo = prompt ? (prompt.index ?? 0) + 1 : null;
+  const text = prompt
+    ? `🧬 *Clone prompt refs*\n\nProject: *${md(project.name)}*\nSource: *Prompt #${promptNo}*\nRefs: *${sourceRefs.length}/${getVideoProjectPromptRefLimit(project)}*\n\nКлонирует эти refs в другие prompts.`
+    : `🧬 *Clone Project refs*\n\nProject: *${md(project.name)}*\nSource: *Project refs*\nRefs: *${sourceRefs.length}/${VIDEO_PROJECT_MAX_REFS}*\n\nКлонирует Project refs в prompts.`;
+
+  const rows = [];
+  if (prompt) {
+    rows.push([{ text: "➡️ To prompts without refs", callback_data: `vp_clone_pr_missing_${project.id}_${prompt.id}` }]);
+    rows.push([{ text: "🔟 To next 10 prompts", callback_data: `vp_clone_pr_next10_${project.id}_${prompt.id}` }]);
+    rows.push([{ text: "♻️ To all other prompts", callback_data: `vp_clone_pr_all_${project.id}_${prompt.id}` }]);
+    rows.push([{ text: "◀️ Prompt refs", callback_data: `vp_promptref_${project.id}_${prompt.id}` }]);
+  } else {
+    rows.push([{ text: "➡️ To prompts without refs", callback_data: `vp_clone_proj_missing_${project.id}` }]);
+    rows.push([{ text: "♻️ To all prompts", callback_data: `vp_clone_proj_all_${project.id}` }]);
+    rows.push([{ text: "◀️ Project", callback_data: `vp_project_${project.id}` }]);
+  }
+
+  const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
+  if (msgId) return bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }).catch(() => {});
+  return bot.sendMessage(chatId, text, opts);
+}
+
+function showVideoProjectRefPresetMenu(chatId, projectId, promptId = null, msgId = null) {
+  const project = videoProjects[projectId];
+  if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") return showVideoProjectsMenu(chatId, msgId);
+  normalizeVideoProject(project);
+  const prompt = promptId ? findVideoProjectPrompt(project, promptId) : null;
+  if (promptId && !prompt) return showVideoProjectPromptRefsMenu(chatId, projectId, msgId, 0);
+
+  const s = getState(chatId);
+  s.vpPresetTarget = { projectId, promptId: prompt ? prompt.id : null };
+
+  const custom = getChatRefPresets(chatId);
+  const targetName = prompt ? `Prompt #${(prompt.index ?? 0) + 1}` : "Project refs";
+  const targetRefs = prompt ? (prompt.refs || []) : (project.defaultRefs || []);
+  const text =
+    `🏷 *Ref presets*\n\n` +
+    `Target: *${md(targetName)}*\n` +
+    `Refs сейчас: *${targetRefs.length}*\n\n` +
+    `Preset переименует refs по порядку и обновит filenames для FastGen. Фото не добавляются автоматически.`;
+
+  const rows = [];
+  for (const preset of VIDEO_PROJECT_BUILTIN_REF_PRESETS) {
+    rows.push([{ text: `${preset.name} (${preset.labels.slice(0, 3).join(", ")})`, callback_data: `vp_rpreset_builtin_${preset.id}` }]);
+  }
+  if (custom.length) {
+    rows.push([{ text: "— Пользовательские —", callback_data: "noop" }]);
+    for (const preset of custom.slice(0, 10)) {
+      rows.push([{ text: `🏷 ${preset.name} (${preset.labels.slice(0, 3).join(", ")})`, callback_data: `vp_rpreset_custom_${preset.id}` }]);
+    }
+  }
+  rows.push([{ text: "➕ Create custom preset", callback_data: "vp_rpreset_new" }, { text: "🗑 Manage", callback_data: "vp_rpreset_manage" }]);
+  rows.push([{ text: "◀️ Назад", callback_data: prompt ? `vp_promptref_${project.id}_${prompt.id}` : `vp_project_${project.id}` }]);
+
+  const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
+  if (msgId) return bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }).catch(() => {});
+  return bot.sendMessage(chatId, text, opts);
+}
+
+function showVideoProjectRefPresetManage(chatId, msgId = null) {
+  const custom = getChatRefPresets(chatId);
+  const text = custom.length
+    ? `🗑 *Custom ref presets*\n\nВыбери preset для удаления.`
+    : `🗑 *Custom ref presets*\n\nПользовательских presets пока нет.`;
+  const rows = custom.slice(0, 20).map(p => [{ text: `🗑 ${p.name} (${p.labels.join(", ")})`, callback_data: `vp_rpreset_del_${p.id}` }]);
+  rows.push([{ text: "◀️ Presets", callback_data: "vp_rpreset_back" }]);
+  const opts = { parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } };
+  if (msgId) return bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }).catch(() => {});
+  return bot.sendMessage(chatId, text, opts);
+}
+
 function showVideoProjectHistory(chatId, msgId = null) {
   const h = (videoProjectHistory[String(chatId)] || []).slice(0, 10);
   if (h.length === 0) {
@@ -777,7 +1245,7 @@ function showVideoProjectSettings(chatId, msgId = null) {
     `📐 Ratio: *${s.ratio}*\n` +
     `🖥 Grok resolution: *${s.resolution || "720p"}*\n` +
     `⏱ Grok duration: *${s.grokDuration || "6s"}*\n\n` +
-    `Лимит референсов на проект: *${VIDEO_PROJECT_MAX_REFS}*`;
+    `Лимит хранения refs: *${VIDEO_PROJECT_MAX_REFS}* на project fallback и prompt. При генерации бот автоматически режет refs до лимита выбранной модели: Grok до 7, Veo/Flow до 3, Flower до 1. Presets меняют подписи refs, Clone refs копирует refs между prompts.`;
   const kb = { inline_keyboard: [
     [{ text: "📐 Change ratio", callback_data: "open_ratio" }],
     ...(VIDEO_MODELS[s.vidModel]?.hasResolution ? [[{ text: "🖥 Grok resolution", callback_data: "open_resolution" }]] : []),
@@ -868,8 +1336,11 @@ async function generateVideoProjectPrompt(projectId, promptId) {
     return;
   }
 
-  const refs = (promptItem.refs && promptItem.refs.length ? promptItem.refs : project.defaultRefs || []).slice(0, VIDEO_PROJECT_MAX_REFS);
-  const operation = refs.length > 0 ? model.opImg : model.opText;
+  const rawRefs = (promptItem.refs && promptItem.refs.length ? promptItem.refs : project.defaultRefs || []).slice(0, getVideoProjectPromptRefLimit(project));
+  const refPrefix = promptItem.refs && promptItem.refs.length ? `prompt_${(promptItem.index ?? 0) + 1}_ref` : "project_ref";
+  const refs = normalizeVideoProjectRefs(rawRefs, refPrefix);
+  const apiInputs = videoProjectRefsForApi(refs, refPrefix);
+  const operation = apiInputs.length > 0 ? model.opImg : model.opText;
   if (!operation) {
     promptItem.status = "failed";
     promptItem.error = `Модель ${model.label} не поддерживает выбранный режим с референсами`;
@@ -886,9 +1357,9 @@ async function generateVideoProjectPrompt(projectId, promptId) {
     try {
       const body = {
         operation,
-        prompt: promptItem.prompt,
+        prompt: `${promptItem.prompt}${videoProjectRefsPromptBlock(refs, refPrefix)}`,
         aspect_ratio: project.ratio || "16:9",
-        ...(refs.length > 0 && { inputs: refs }),
+        ...(apiInputs.length > 0 && { inputs: apiInputs }),
         ...(model.hasResolution && { resolution: project.resolution || "720p" }),
         ...(model.hasDuration && project.grokDuration && { duration: project.grokDuration }),
       };
@@ -933,6 +1404,7 @@ async function generateVideoProjectPrompt(projectId, promptId) {
         `🎬 *Video Ready*\n\n` +
         `Project: *${md(project.name)}*\n` +
         `Prompt: _${md(cut(promptItem.prompt, 180))}_\n` +
+        (refs.length ? `Refs: *${md(refs.map((r, i) => videoProjectRefLabel(r, i, refPrefix)).join(", "))}*\n` : "") +
         `Progress: *${progress}%*`;
 
       for (const item of pollResult.results || []) {
@@ -1040,7 +1512,7 @@ async function handleVideoProjectCallback(query, helpers) {
   const s = getState(chatId);
   const { edit, del, cancelKb } = helpers;
 
-  if (data === "open_video_projects") {
+  if (data === "open_video_projects" || data === "vp_menu") {
     s.step = null;
     s.videoProjectDraft = null;
     s.videoProjectSelectedId = null;
@@ -1076,14 +1548,116 @@ async function handleVideoProjectCallback(query, helpers) {
     return showVideoProjectEditor(chatId, project.id, msgId);
   }
 
-  if (data === "vp_list") return showVideoProjectList(chatId, msgId, "details");
+  if (data === "vp_list" || data === "vp_my") return showVideoProjectList(chatId, msgId, "details");
   if (data === "vp_pause_menu") return showVideoProjectList(chatId, msgId, "pause");
   if (data === "vp_resume_menu") return showVideoProjectList(chatId, msgId, "resume");
   if (data === "vp_delete_menu") return showVideoProjectList(chatId, msgId, "delete");
   if (data === "vp_history") return showVideoProjectHistory(chatId, msgId);
   if (data === "vp_settings") return showVideoProjectSettings(chatId, msgId);
 
+  if (data.startsWith("vp_presets_")) {
+    const rest = data.replace("vp_presets_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx >= 0) return showVideoProjectRefPresetMenu(chatId, rest.slice(0, idx), rest.slice(idx + 1), msgId);
+    return showVideoProjectRefPresetMenu(chatId, rest, null, msgId);
+  }
+
+  if (data.startsWith("vp_rpreset_builtin_")) {
+    const presetId = data.replace("vp_rpreset_builtin_", "");
+    const preset = getVideoProjectPresetById(chatId, "builtin", presetId);
+    const result = applyVideoProjectRefPresetToTarget(chatId, preset);
+    await bot.sendMessage(chatId, result.message, { parse_mode: "Markdown" });
+    const target = getVideoProjectPresetTarget(chatId);
+    if (target?.prompt) return showVideoProjectPromptRefEditor(chatId, target.project.id, target.prompt.id, msgId);
+    if (target?.project) return showVideoProjectEditor(chatId, target.project.id, msgId);
+    return showVideoProjectsMenu(chatId, msgId);
+  }
+
+  if (data.startsWith("vp_rpreset_custom_")) {
+    const presetId = data.replace("vp_rpreset_custom_", "");
+    const preset = getVideoProjectPresetById(chatId, "custom", presetId);
+    const result = applyVideoProjectRefPresetToTarget(chatId, preset);
+    await bot.sendMessage(chatId, result.message, { parse_mode: "Markdown" });
+    const target = getVideoProjectPresetTarget(chatId);
+    if (target?.prompt) return showVideoProjectPromptRefEditor(chatId, target.project.id, target.prompt.id, msgId);
+    if (target?.project) return showVideoProjectEditor(chatId, target.project.id, msgId);
+    return showVideoProjectsMenu(chatId, msgId);
+  }
+
+  if (data === "vp_rpreset_new") {
+    s.step = "vp_wait_custom_ref_preset";
+    return edit(
+      `➕ *Create custom ref preset*\n\nФорматы:\n\n\`My Pack: hero, outfit, location\`\n\nили:\n\`My Pack\`\n\`hero\`\n\`outfit\`\n\`location\`\n\nМаксимум ${VIDEO_PROJECT_MAX_REFS} labels.`,
+      { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "vp_rpreset_back" }]] }
+    );
+  }
+
+  if (data === "vp_rpreset_manage") return showVideoProjectRefPresetManage(chatId, msgId);
+
+  if (data.startsWith("vp_rpreset_del_")) {
+    const presetId = data.replace("vp_rpreset_del_", "");
+    const list = getChatRefPresets(chatId);
+    const before = list.length;
+    videoRefPresets[String(chatId)] = list.filter(p => p.id !== presetId);
+    if (videoRefPresets[String(chatId)].length !== before) saveVideoRefPresets();
+    await bot.sendMessage(chatId, "🗑 Custom preset удалён.");
+    return showVideoProjectRefPresetManage(chatId, msgId);
+  }
+
+  if (data === "vp_rpreset_back") {
+    const target = getVideoProjectPresetTarget(chatId);
+    if (target?.prompt) return showVideoProjectRefPresetMenu(chatId, target.project.id, target.prompt.id, msgId);
+    if (target?.project) return showVideoProjectRefPresetMenu(chatId, target.project.id, null, msgId);
+    return showVideoProjectsMenu(chatId, msgId);
+  }
+
+  if (data.startsWith("vp_clone_proj_missing_")) {
+    const projectId = data.replace("vp_clone_proj_missing_", "");
+    const project = videoProjects[projectId];
+    if (!project || String(project.chatId) !== String(chatId)) return bot.sendMessage(chatId, "❌ Проект не найден.");
+    const count = cloneRefsToVideoProjectPrompts(project, project.defaultRefs || [], "missing");
+    await bot.sendMessage(chatId, `🧬 Project refs склонированы в prompts без refs: *${count}*`, { parse_mode: "Markdown" });
+    return showVideoProjectEditor(chatId, projectId, msgId);
+  }
+
+  if (data.startsWith("vp_clone_proj_all_")) {
+    const projectId = data.replace("vp_clone_proj_all_", "");
+    const project = videoProjects[projectId];
+    if (!project || String(project.chatId) !== String(chatId)) return bot.sendMessage(chatId, "❌ Проект не найден.");
+    const count = cloneRefsToVideoProjectPrompts(project, project.defaultRefs || [], "all");
+    await bot.sendMessage(chatId, `🧬 Project refs склонированы во все prompts: *${count}*`, { parse_mode: "Markdown" });
+    return showVideoProjectEditor(chatId, projectId, msgId);
+  }
+
+  if (data.startsWith("vp_clone_pr_missing_") || data.startsWith("vp_clone_pr_all_") || data.startsWith("vp_clone_pr_next10_")) {
+    const mode = data.startsWith("vp_clone_pr_missing_") ? "missing" : data.startsWith("vp_clone_pr_next10_") ? "next10" : "all";
+    const rest = data.replace(/^vp_clone_pr_(missing|all|next10)_/, "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || !prompt) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const count = cloneRefsToVideoProjectPrompts(project, prompt.refs || [], mode, prompt);
+    await bot.sendMessage(chatId, `🧬 Prompt refs склонированы: *${count}*`, { parse_mode: "Markdown" });
+    return showVideoProjectPromptRefEditor(chatId, projectId, promptId, msgId);
+  }
+
+  if (data.startsWith("vp_clone_")) {
+    const projectId = data.replace("vp_clone_", "");
+    return showVideoProjectCloneRefsMenu(chatId, projectId, null, msgId);
+  }
+
+  if (data.startsWith("vp_pclone_")) {
+    const rest = data.replace("vp_pclone_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    return showVideoProjectCloneRefsMenu(chatId, rest.slice(0, idx), rest.slice(idx + 1), msgId);
+  }
+
   if (data.startsWith("vp_project_")) return showVideoProjectEditor(chatId, data.replace("vp_project_", ""), msgId);
+  if (data.startsWith("vp_addrefs_")) return showVideoProjectEditor(chatId, data.replace("vp_addrefs_", ""), msgId);
 
   if (data.startsWith("vp_status_")) {
     const id = data.replace("vp_status_", "");
@@ -1108,20 +1682,115 @@ async function handleVideoProjectCallback(query, helpers) {
     return edit("✏️ Отправь промпты текстом. Каждая строка = один prompt.", { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `vp_project_${id}` }]] });
   }
 
-  if (data.startsWith("vp_refs_")) {
-    const id = data.replace("vp_refs_", "");
+  if (data.startsWith("vp_refs_rename_")) {
+    const id = data.replace("vp_refs_rename_", "");
     const project = videoProjects[id];
     if (!project || String(project.chatId) !== String(chatId)) return bot.sendMessage(chatId, "❌ Проект не найден.");
-    s.step = `vp_wait_refs_${id}`;
-    return edit(`🖼 Отправь до ${VIDEO_PROJECT_MAX_REFS} reference images. Уже добавлено: ${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}.`, {
-      inline_keyboard: [[{ text: "✅ Готово", callback_data: `vp_refs_done_${id}` }], [{ text: "❌ Отмена", callback_data: `vp_project_${id}` }]]
-    });
+    normalizeVideoProject(project);
+    if (!project.defaultRefs.length) return bot.sendMessage(chatId, "❌ У проекта нет refs для подписи.");
+    s.step = `vp_wait_project_ref_labels_${id}`;
+    return edit(
+      `✏️ *Rename project refs*\n\nТекущие подписи:\n${formatVideoProjectRefsList(project.defaultRefs, "project_ref")}\n\nОтправь подписи строками:\n\`1=main_character\`\n\`2=outfit\`\n\`3=location\``,
+      { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `vp_project_${id}` }]] }
+    );
   }
 
   if (data.startsWith("vp_refs_done_")) {
     const id = data.replace("vp_refs_done_", "");
     s.step = null;
     return showVideoProjectEditor(chatId, id, msgId);
+  }
+
+  if (data.startsWith("vp_refs_")) {
+    const id = data.replace("vp_refs_", "");
+    const project = videoProjects[id];
+    if (!project || String(project.chatId) !== String(chatId)) return bot.sendMessage(chatId, "❌ Проект не найден.");
+    s.step = `vp_wait_refs_${id}`;
+    return edit(`🖼 Отправь общие reference images для проекта. Они будут fallback для prompts без своих refs.
+
+Чтобы подписать ref сразу, отправь фото с caption, например: \`main_character\`, \`outfit\`, \`location\`.
+
+Уже добавлено: ${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS}.`, {
+      inline_keyboard: [[{ text: "✅ Готово", callback_data: `vp_refs_done_${id}` }], [{ text: "❌ Отмена", callback_data: `vp_project_${id}` }]]
+    });
+  }
+
+  if (data.startsWith("vp_promptrefs_")) {
+    const rest = data.replace("vp_promptrefs_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const id = rest.slice(0, lastUnderscore);
+    const page = parseInt(rest.slice(lastUnderscore + 1)) || 0;
+    return showVideoProjectPromptRefsMenu(chatId, id, msgId, page);
+  }
+
+  if (data.startsWith("vp_promptref_add_")) {
+    const rest = data.replace("vp_promptref_add_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || !prompt) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const limit = getVideoProjectPromptRefLimit(project);
+    const current = Array.isArray(prompt.refs) ? prompt.refs.length : 0;
+    if (current >= limit) return bot.sendMessage(chatId, `❌ У этого prompt уже максимум ${limit} refs.`);
+    s.step = `vp_wait_prompt_refs_${projectId}_${promptId}`;
+    return edit(`🧷 *Add refs to prompt*
+
+Отправь фото для этого prompt. Можно добавить ещё ${limit - current}.
+
+Чтобы подписать ref сразу, отправь фото с caption, например: \`hero\`, \`outfit\`, \`location\`.
+
+Когда закончишь — нажми «Готово».`, {
+      inline_keyboard: [[{ text: "✅ Готово", callback_data: `vp_promptref_${projectId}_${promptId}` }], [{ text: "❌ Отмена", callback_data: `vp_promptref_${projectId}_${promptId}` }]]
+    });
+  }
+
+  if (data.startsWith("vp_promptref_rename_")) {
+    const rest = data.replace("vp_promptref_rename_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || !prompt) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    normalizeVideoProject(project);
+    if (!prompt.refs.length) return bot.sendMessage(chatId, "❌ У prompt нет refs для подписи.");
+    s.step = `vp_wait_prompt_ref_labels_${projectId}_${promptId}`;
+    const promptNo = (prompt.index ?? 0) + 1;
+    return edit(
+      `✏️ *Rename prompt refs*\n\nТекущие подписи:\n${formatVideoProjectRefsList(prompt.refs, `prompt_${promptNo}_ref`)}\n\nОтправь подписи строками:\n\`1=hero\`\n\`2=outfit\`\n\`3=background\``,
+      { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `vp_promptref_${projectId}_${promptId}` }]] }
+    );
+  }
+
+  if (data.startsWith("vp_promptref_clear_")) {
+    const rest = data.replace("vp_promptref_clear_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || !prompt) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    prompt.refs = [];
+    prompt.updatedAt = Date.now();
+    project.updatedAt = Date.now();
+    saveVideoProjects();
+    await bot.sendMessage(chatId, "🧹 Refs этого prompt очищены.");
+    return showVideoProjectPromptRefEditor(chatId, projectId, promptId, msgId);
+  }
+
+  if (data.startsWith("vp_promptref_")) {
+    const rest = data.replace("vp_promptref_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    s.step = null;
+    return showVideoProjectPromptRefEditor(chatId, projectId, promptId, msgId);
   }
 
   if (data.startsWith("vp_start_")) {
@@ -1164,6 +1833,9 @@ async function handleVideoProjectCallback(query, helpers) {
     return showVideoProjectEditor(chatId, id, msgId);
   }
 
+  if (data.startsWith("vp_delete_")) {
+    data = "vp_del_" + data.replace("vp_delete_", "");
+  }
   if (data.startsWith("vp_del_")) {
     const id = data.replace("vp_del_", "");
     const project = videoProjects[id];
@@ -1175,6 +1847,9 @@ async function handleVideoProjectCallback(query, helpers) {
     await bot.sendMessage(chatId, `🗑 Project deleted: *${md(project.name)}*`, { parse_mode: "Markdown" });
     return showVideoProjectsMenu(chatId, msgId);
   }
+
+  console.warn(`[callback] unsupported video project callback: ${data}`);
+  return showVideoProjectsMenu(chatId, msgId);
 }
 
 // ─── Баланс UI ────────────────────────────
@@ -1321,14 +1996,14 @@ function showBatchSettingsMenu(chatId, msgId = null) {
     : Object.entries(VIDEO_MODELS).map(([k, v]) => [{ text: `${vidModelKey === k ? "✅ " : ""}${v.label}`, callback_data: `bset_vm_${k}` }]);
 
   const ratioRows = [RATIOS.map(r => ({ text: `${ratio === r ? "✅ " : ""}${r}`, callback_data: `bset_ratio_${r.replace(":", "x")}` }))];
-  const resRow = !isImage && isGrok ? [[["480p", "720p"].map(r => ({ text: `${resolution === r ? "✅ " : ""}${r}`, callback_data: `bset_res_${r}` }))]] : [];
-  const durRow = !isImage && isGrok ? [[["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с(1кр)" : "10с(3кр)"}`, callback_data: `bset_dur_${d}` }))]] : [];
+  const resRow = !isImage && isGrok ? [["480p", "720p"].map(r => ({ text: `${resolution === r ? "✅ " : ""}${r}`, callback_data: `bset_res_${r}` }))] : [];
+  const durRow = !isImage && isGrok ? [["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с(1кр)" : "10с(3кр)"}`, callback_data: `bset_dur_${d}` }))] : [];
 
   const kb = { inline_keyboard: [
     ...modelRows,
     ...ratioRows,
-    ...(resRow.length ? resRow[0].map(r => [r]) : []),
-    ...(durRow.length ? durRow[0].map(d => [d]) : []),
+    ...(resRow.length ? resRow : []),
+    ...(durRow.length ? durRow : []),
     [{ text: "🔄 Сбросить (= главное меню)", callback_data: "bset_reset" }],
     [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
   ]};
@@ -2373,9 +3048,10 @@ async function checkGeneration(chatId, genId) {
 const mediaGroupTimers = new Map();
 
 bot.on("callback_query", async (query) => {
+  try {
   const chatId = query.message.chat.id;
   const msgId  = query.message.message_id;
-  const data   = query.data;
+  let data     = query.data;
   const s      = getState(chatId);
 
   bot.answerCallbackQuery(query.id).catch(() => {});
@@ -2471,6 +3147,10 @@ bot.on("callback_query", async (query) => {
       ]
     });
   }
+  if (data === "refs_done") {
+    if (s.tab === "video_ref") data = "vid_ref_photos_done";
+    else data = "ref_photos_done";
+  }
   if (data === "ref_photos_done") {
     if (!s.pendingRefImages || s.pendingRefImages.length === 0)
       return bot.sendMessage(chatId, "❌ Сначала отправь хотя бы 1 фото!");
@@ -2521,7 +3201,7 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("del_photo_")) { s.batchPhotos.splice(parseInt(data.replace("del_photo_", "")), 1); return showBatchPhotosMenu(chatId, msgId); }
   if (data === "batch_per_prompt") {
     return edit("🔢 Сколько на 1 промпт/фото?", { inline_keyboard: [
-      [[1, 2, 3, 4, 5].map(n => ({ text: s.perPrompt === n ? `✅ ${n}` : `${n}`, callback_data: `set_pp_${n}` }))],
+      [1, 2, 3, 4, 5].map(n => ({ text: s.perPrompt === n ? `✅ ${n}` : `${n}`, callback_data: `set_pp_${n}` })),
       [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
     ]});
   }
@@ -2529,8 +3209,8 @@ bot.on("callback_query", async (query) => {
   if (data === "batch_hourly_limit") {
     const cur = s.batchHourlyLimit || 15;
     return edit(`⏱ *Лимит видео/час*\nСейчас: *${cur}*`, { inline_keyboard: [
-      [[5, 10, 15, 20].map(n => ({ text: cur === n ? `✅ ${n}` : `${n}`, callback_data: `set_hl_${n}` }))],
-      [[25, 30, 40, 50].map(n => ({ text: cur === n ? `✅ ${n}` : `${n}`, callback_data: `set_hl_${n}` }))],
+      [5, 10, 15, 20].map(n => ({ text: cur === n ? `✅ ${n}` : `${n}`, callback_data: `set_hl_${n}` })),
+      [25, 30, 40, 50].map(n => ({ text: cur === n ? `✅ ${n}` : `${n}`, callback_data: `set_hl_${n}` })),
       [{ text: "✏️ Своё число", callback_data: "set_hl_custom" }],
       [{ text: "◀️ Назад", callback_data: "do_batch_menu" }],
     ]});
@@ -2567,6 +3247,7 @@ bot.on("callback_query", async (query) => {
     rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
     return edit("🎨 *Модель изображения:*", { inline_keyboard: rows });
   }
+  if (data.startsWith("set_img_")) { s.imgModel = data.replace("set_img_", ""); saveState(chatId); del(); return showMainMenu(chatId); }
   if (data.startsWith("set_im_")) { s.imgModel = data.replace("set_im_", ""); saveState(chatId); del(); return showMainMenu(chatId); }
 
   if (data === "open_vidmodel") {
@@ -2574,6 +3255,7 @@ bot.on("callback_query", async (query) => {
     rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
     return edit("🎥 *Модель видео:*", { inline_keyboard: rows });
   }
+  if (data.startsWith("set_vid_")) { s.vidModel = data.replace("set_vid_", ""); saveState(chatId); del(); return showMainMenu(chatId); }
   if (data.startsWith("set_vm_")) { s.vidModel = data.replace("set_vm_", ""); saveState(chatId); del(); return showMainMenu(chatId); }
 
   if (data === "open_ratio") {
@@ -2582,9 +3264,11 @@ bot.on("callback_query", async (query) => {
     rows.push([{ text: "◀️ Назад", callback_data: "back_menu" }]);
     return edit("📐 *Соотношение сторон:*", { inline_keyboard: rows });
   }
+  if (data.startsWith("set_ratio_")) { s.ratio = data.replace("set_ratio_", "").replace("x", ":"); saveState(chatId); del(); return showMainMenu(chatId); }
   if (data.startsWith("set_r_")) { s.ratio = data.replace("set_r_", "").replace("x", ":"); saveState(chatId); del(); return showMainMenu(chatId); }
 
   if (data === "open_count") { s.step = "waiting_count"; return edit(`🔢 *Количество* (сейчас: ${s.count})\n\nНапиши от 1 до 500:`, cancelKb); }
+  if (data.startsWith("set_count_")) { s.count = Number(data.replace("set_count_", "")); saveState(chatId); del(); return showMainMenu(chatId); }
 
   if (data === "open_seed") {
     return edit("🌱 *Seed:*", { inline_keyboard: [
@@ -2598,7 +3282,7 @@ bot.on("callback_query", async (query) => {
 
   if (data === "open_resolution") {
     return edit("🖥 *Разрешение Grok Video:*", { inline_keyboard: [
-      [["480p", "720p"].map(r => ({ text: (s.resolution || "720p") === r ? `✅ ${r}` : r, callback_data: `set_res_${r}` }))],
+      ["480p", "720p"].map(r => ({ text: (s.resolution || "720p") === r ? `✅ ${r}` : r, callback_data: `set_res_${r}` })),
       [{ text: "◀️ Назад", callback_data: "open_misc" }],
     ]});
   }
@@ -2610,6 +3294,7 @@ bot.on("callback_query", async (query) => {
 
   // ── Enhance
   if (data === "open_enhance") return showEnhanceMenu(chatId, msgId);
+  if (data.startsWith("set_enh_")) { s.enhanceMode = data.replace("set_enh_", ""); saveState(chatId); return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_always") { s.enhanceMode = "always"; saveState(chatId); return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_ask")    { s.enhanceMode = "ask";    saveState(chatId); return showEnhanceMenu(chatId, msgId); }
   if (data === "enhance_never")  { s.enhanceMode = "never";  saveState(chatId); return showEnhanceMenu(chatId, msgId); }
@@ -2687,8 +3372,8 @@ bot.on("callback_query", async (query) => {
   if (data === "pg_split_sent")  { s.pgSplitMode = "sentences"; saveState(chatId); return showPromptGenMenu(chatId, msgId); }
   if (data === "pg_parallel") {
     return edit("⚡ *Параллельных запросов:*", { inline_keyboard: [
-      [[1, 2, 3, 5].map(n => ({ text: s.pgParallel === n ? `✅ ${n}` : `${n}`, callback_data: `set_pgp_${n}` }))],
-      [[7, 10, 15, 20].map(n => ({ text: s.pgParallel === n ? `✅ ${n}` : `${n}`, callback_data: `set_pgp_${n}` }))],
+      [1, 2, 3, 5].map(n => ({ text: s.pgParallel === n ? `✅ ${n}` : `${n}`, callback_data: `set_pgp_${n}` })),
+      [7, 10, 15, 20].map(n => ({ text: s.pgParallel === n ? `✅ ${n}` : `${n}`, callback_data: `set_pgp_${n}` })),
       [{ text: "◀️ Назад", callback_data: "open_promptgen" }],
     ]});
   }
@@ -2714,6 +3399,18 @@ bot.on("callback_query", async (query) => {
   if (data === "pg_template_reset") { s.pgTemplate = DEFAULT_STATE().pgTemplate; saveState(chatId); return showPromptGenMenu(chatId, msgId); }
   if (data === "pg_input_text") { s.step = "waiting_pg_story"; return edit("📝 Отправь текст истории:", cancelKb); }
   if (data === "pg_input_file") { s.step = "waiting_pg_file";  return edit("📄 Отправь .txt файл:", cancelKb); }
+  } catch (e) {
+    const cbData = query?.data || "unknown";
+    const chatIdSafe = query?.message?.chat?.id;
+    console.error(`[callback_query] data=${cbData}`, e);
+    try { await bot.answerCallbackQuery(query.id, { text: "Ошибка кнопки. Открой /menu", show_alert: false }); } catch {}
+    if (chatIdSafe) {
+      await bot.sendMessage(chatIdSafe, `❌ Ошибка кнопки: ${String(e.message || e).slice(0, 300)}
+
+Открой меню заново: /menu`).catch(() => {});
+    }
+  }
+
 });
 
 // ─── Фото handler ─────────────────────────
@@ -2721,6 +3418,49 @@ bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
   const s = getState(chatId);
   const fileId = msg.photo[msg.photo.length - 1].file_id;
+
+  if (s.step && s.step.startsWith("vp_wait_prompt_refs_")) {
+    const rest = s.step.replace("vp_wait_prompt_refs_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) {
+      s.step = null;
+      return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    }
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted" || !prompt) {
+      s.step = null;
+      return bot.sendMessage(chatId, "❌ Video Project prompt не найден.");
+    }
+    normalizeVideoProject(project);
+    if (!Array.isArray(prompt.refs)) prompt.refs = [];
+    const limit = getVideoProjectPromptRefLimit(project);
+    if (prompt.refs.length >= limit) {
+      return bot.sendMessage(chatId, `❌ Максимум ${limit} reference images на один prompt.`, {
+        reply_markup: { inline_keyboard: [[{ text: "🧷 Prompt refs", callback_data: `vp_promptref_${projectId}_${promptId}` }]] }
+      });
+    }
+    try {
+      const dataUri = await tgPhotoToDataUri(fileId);
+      const label = getVideoProjectPhotoLabel(msg, `prompt ${(prompt.index ?? 0) + 1} ref ${prompt.refs.length + 1}`);
+      prompt.refs.push(makeVideoProjectRef(dataUri, label, prompt.refs.length, `prompt_${(prompt.index ?? 0) + 1}_ref`));
+      prompt.updatedAt = Date.now();
+      project.updatedAt = Date.now();
+      saveVideoProjects();
+      return bot.sendMessage(chatId, `✅ Reference для prompt добавлен: ${prompt.refs.length}/${limit}.
+Подпись: *${md(label)}*`, {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [
+          [{ text: "✅ Готово", callback_data: `vp_promptref_${projectId}_${promptId}` }],
+          [{ text: "🧷 Prompt refs", callback_data: `vp_promptref_${projectId}_${promptId}` }],
+        ]}
+      });
+    } catch(e) {
+      return bot.sendMessage(chatId, `❌ Ошибка загрузки reference image: ${e.message}`);
+    }
+  }
 
   if (s.step && s.step.startsWith("vp_wait_refs_")) {
     const projectId = s.step.replace("vp_wait_refs_", "");
@@ -2737,10 +3477,13 @@ bot.on("photo", async (msg) => {
     }
     try {
       const dataUri = await tgPhotoToDataUri(fileId);
-      project.defaultRefs.push(dataUri);
+      const label = getVideoProjectPhotoLabel(msg, `project ref ${project.defaultRefs.length + 1}`);
+      project.defaultRefs.push(makeVideoProjectRef(dataUri, label, project.defaultRefs.length, "project_ref"));
       project.updatedAt = Date.now();
       saveVideoProjects();
-      return bot.sendMessage(chatId, `✅ Reference ${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS} добавлен.`, {
+      return bot.sendMessage(chatId, `✅ Reference ${project.defaultRefs.length}/${VIDEO_PROJECT_MAX_REFS} добавлен.
+Подпись: *${md(label)}*`, {
+        parse_mode: "Markdown",
         reply_markup: { inline_keyboard: [
           [{ text: "✅ Готово", callback_data: `vp_refs_done_${projectId}` }],
           [{ text: "📂 Project", callback_data: `vp_project_${projectId}` }],
@@ -2912,6 +3655,69 @@ bot.on("message", async (msg) => {
 
   if (msg.text === "📊 Project Status") {
     return showLatestVideoProjectStatus(chatId);
+  }
+
+  if (s.step && s.step.startsWith("vp_wait_project_ref_labels_")) {
+    const projectId = s.step.replace("vp_wait_project_ref_labels_", "");
+    const project = videoProjects[projectId];
+    if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted") {
+      s.step = null;
+      return bot.sendMessage(chatId, "❌ Video Project не найден.");
+    }
+    normalizeVideoProject(project);
+    project.defaultRefs = applyVideoProjectRefLabels(project.defaultRefs, parseVideoProjectRefLabels(msg.text), "project_ref");
+    project.updatedAt = Date.now();
+    s.step = null;
+    saveVideoProjects();
+    return bot.sendMessage(chatId, `✅ Project refs подписаны.\n\n${formatVideoProjectRefsList(project.defaultRefs, "project_ref")}`, {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "📂 Открыть проект", callback_data: `vp_project_${projectId}` }]] }
+    });
+  }
+
+  if (s.step && s.step.startsWith("vp_wait_prompt_ref_labels_")) {
+    const rest = s.step.replace("vp_wait_prompt_ref_labels_", "");
+    const idx = rest.indexOf("_vpp_");
+    if (idx < 0) {
+      s.step = null;
+      return bot.sendMessage(chatId, "❌ Prompt не найден.");
+    }
+    const projectId = rest.slice(0, idx);
+    const promptId = rest.slice(idx + 1);
+    const project = videoProjects[projectId];
+    const prompt = project ? findVideoProjectPrompt(project, promptId) : null;
+    if (!project || String(project.chatId) !== String(chatId) || project.status === "deleted" || !prompt) {
+      s.step = null;
+      return bot.sendMessage(chatId, "❌ Video Project prompt не найден.");
+    }
+    normalizeVideoProject(project);
+    const promptNo = (prompt.index ?? 0) + 1;
+    prompt.refs = applyVideoProjectRefLabels(prompt.refs, parseVideoProjectRefLabels(msg.text), `prompt_${promptNo}_ref`);
+    prompt.updatedAt = Date.now();
+    project.updatedAt = Date.now();
+    s.step = null;
+    saveVideoProjects();
+    return bot.sendMessage(chatId, `✅ Prompt refs подписаны.\n\n${formatVideoProjectRefsList(prompt.refs, `prompt_${promptNo}_ref`)}`, {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🧷 Prompt refs", callback_data: `vp_promptref_${projectId}_${promptId}` }]] }
+    });
+  }
+
+  if (s.step === "vp_wait_custom_ref_preset") {
+    const preset = parseCustomRefPreset(msg.text);
+    if (!preset) {
+      return bot.sendMessage(chatId, "❌ Не удалось создать preset. Формат: `My Pack: hero, outfit, location`", { parse_mode: "Markdown" });
+    }
+    const list = getChatRefPresets(chatId);
+    list.unshift(preset);
+    if (list.length > 30) list.length = 30;
+    videoRefPresets[String(chatId)] = list;
+    saveVideoRefPresets();
+    s.step = null;
+    return bot.sendMessage(chatId, `✅ Custom preset создан: *${md(preset.name)}*\nLabels: ${md(preset.labels.join(", "))}`, {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🏷 Presets", callback_data: "vp_rpreset_back" }]] }
+    });
   }
 
   if (s.step === "vp_wait_name") {
