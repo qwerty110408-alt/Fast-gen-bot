@@ -3,14 +3,48 @@ const crypto = require("crypto");
 const axios = require("axios");
 const fs = require("fs");
 const FormData = require("form-data");
-const mammoth = require("mammoth");
+let mammoth = null;
+try {
+  mammoth = require("mammoth");
+} catch (e) {
+  console.warn("[startup] mammoth is not installed. DOCX import for Video Projects is disabled until you run: npm install mammoth");
+}
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const FASTGEN_API_KEY = process.env.FASTGEN_API_KEY;
 const BASE_URL = "https://googler.fast-gen.ai";
 const STORAGE_URL = "https://storage.fast-gen.ai";
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+if (!TELEGRAM_TOKEN) {
+  console.error("[startup] Missing TELEGRAM_TOKEN environment variable");
+  process.exit(1);
+}
+if (!FASTGEN_API_KEY) {
+  console.error("[startup] Missing FASTGEN_API_KEY environment variable");
+  process.exit(1);
+}
+
+const bot = new TelegramBot(TELEGRAM_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10 },
+  },
+});
+
+bot.on("polling_error", (err) => {
+  console.error("[polling_error]", err?.message || err);
+});
+bot.on("webhook_error", (err) => {
+  console.error("[webhook_error]", err?.message || err);
+});
 
 // ─── Персистентное состояние ──────────────
 const STATE_FILE = "./user_states.json";
@@ -766,6 +800,9 @@ async function extractVideoProjectPrompts(buffer, filename) {
   if (name.endsWith(".txt")) {
     text = buffer.toString("utf-8");
   } else if (name.endsWith(".docx")) {
+    if (!mammoth) {
+      throw new Error("DOCX import отключён: не установлен пакет mammoth. Выполни: npm install mammoth");
+    }
     const out = await mammoth.extractRawText({ buffer });
     text = out.value || "";
   } else {
@@ -2982,12 +3019,6 @@ restoreVideoProjectsAfterRestart();
 setTimeout(() => processVideoProjects().catch(e => console.error(`[VideoProject] startup error: ${e.message}`)), 5000);
 setInterval(() => processVideoProjects().catch(e => console.error(`[VideoProject] interval error: ${e.message}`)), VIDEO_PROJECT_PROCESS_MS);
 
-process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
-});
 process.once("SIGTERM", () => {
   saveJSON(STATE_FILE, persistedStates);
   saveJSON(HISTORY_FILE, persistedHistory);
