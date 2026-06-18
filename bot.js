@@ -621,6 +621,12 @@ function cut(text, max = 180) {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
+function cleanErrorMessage(err, max = 700) {
+  const raw = err?.response?.data?.detail || err?.response?.data?.message || err?.response?.data?.error || err?.message || err || "Неизвестная ошибка";
+  const str = typeof raw === "object" ? JSON.stringify(raw) : String(raw);
+  return str.replace(/\|REFUNDED:(true|false)/g, "").slice(0, max);
+}
+
 const FASTGEN_MAX_SEED = 2147483647;
 
 function makeGenerationSeed(seedMode = "random") {
@@ -2649,7 +2655,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
       }
 
       const idxStr = batchIdx ? `*${batchIdx}* ` : "";
-      const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
+      const caption = `${idxStr}${md(model.label)}\n📝 _${md(prompt.slice(0, 100))}_`;
       const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
 
       try {
@@ -2704,7 +2710,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
   await bot.sendMessage(chatId,
     `❌ *Ошибка после ${MAX_RETRIES} попыток перегенерации*${label ? ` [${label}]` : ""}\n` +
     `🤖 ${model.label}\n` +
-    `${lastError?.message?.slice(0, 400) || "Неизвестная ошибка"}\n` +
+    `${cleanErrorMessage(lastError, 400)}\n` +
     `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
     {
       parse_mode: "Markdown",
@@ -2731,7 +2737,7 @@ async function retryFailedTask(chatId, errKey) {
   };
 
   const statusMsg = await bot.sendMessage(chatId,
-    `🔄 *Перегенерирую задачу...*\n🤖 ${model.label}\n📝 _${prompt.slice(0, 80)}_`,
+    `🔄 *Перегенерирую задачу...*\n🤖 ${md(model.label)}\n📝 _${md(prompt.slice(0, 80))}_`,
     { parse_mode: "Markdown" }
   );
 
@@ -2813,6 +2819,7 @@ async function runNormal(chatId, s, prompt) {
     const count = s.count;
     const queue = isImage ? imageQueue : videoQueue;
     let done = 0, errors = 0;
+    const errorMessages = [];
     const statusMsg = await bot.sendMessage(chatId,
       `⏳ *${count} задач в очереди*\n🎨 ${model.label}\n💳 ${model.credits}\n(макс. 10 параллельно)`,
       { parse_mode: "Markdown" });
@@ -2842,6 +2849,7 @@ async function runNormal(chatId, s, prompt) {
             done++;
           } catch(e) {
             errors++;
+            errorMessages.push(cleanErrorMessage(e, 350));
           }
           bot.editMessageText(
             `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
@@ -2854,7 +2862,10 @@ async function runNormal(chatId, s, prompt) {
       const tasks = Array.from({ length: count }, (_, i) =>
         queue(() => genOne(chatId, s, finalPrompt, operation, model, isImage, i + 1, count))
           .then(() => done++)
-          .catch(() => errors++)
+          .catch((e) => {
+            errors++;
+            errorMessages.push(cleanErrorMessage(e, 350));
+          })
           .finally(() => {
             bot.editMessageText(
               `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
@@ -2865,8 +2876,13 @@ async function runNormal(chatId, s, prompt) {
       await Promise.allSettled(tasks);
     }
 
-    await bot.editMessageText(
-      `✅ Готово! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+    const finalStatusText = errors === 0
+      ? `✅ Готово! ✓${done}`
+      : done > 0
+        ? `⚠️ Готово частично: ✓${done} ✗${errors}\n\nПоследняя ошибка:\n${errorMessages[0] || "см. логи сервера"}`
+        : `❌ Генерация не удалась: ✓${done} ✗${errors}\n\nПоследняя ошибка:\n${errorMessages[0] || "см. логи сервера"}`;
+
+    await bot.editMessageText(finalStatusText,
       { chat_id: chatId, message_id: statusMsg.message_id }
     ).catch(() => {});
     showMainMenu(chatId);
@@ -2912,7 +2928,7 @@ async function runKeyframes(chatId, s, prompt) {
           const media = item.data
             ? { type: "data_uri", value: item.data, mediaType: "video" }
             : { type: "url", value: url, mediaType: "video" };
-          await sendV5Media(chatId, media, withSeedCaption(`🎞 Ключ. кадры\n📝 _${finalPrompt.slice(0, 100)}_`, item, pollResult, requestSeed));
+          await sendV5Media(chatId, media, withSeedCaption(`🎞 Ключ. кадры\n📝 _${md(finalPrompt.slice(0, 100))}_`, item, pollResult, requestSeed));
         }
       }
     } catch(e) {
@@ -3008,7 +3024,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
   const failMsg =
     `❌ *Пропущена задача ${batchIdx || ""}* (5 попыток)\n` +
     `🤖 ${model.label}\n` +
-    `${lastError?.message?.slice(0, 300) || "Неизвестная ошибка"}\n` +
+    `${cleanErrorMessage(lastError, 300)}\n` +
     `💳 ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`;
   bot.sendMessage(chatId, failMsg, {
     parse_mode: "Markdown",
@@ -3021,7 +3037,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
 async function sendBatchResult(chatId, result, batchIdx, model) {
   const { results, prompt, requestSeed, pollResult } = result;
   const idxStr = batchIdx ? `*${batchIdx}* ` : "";
-  const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
+  const caption = `${idxStr}${md(model.label)}\n📝 _${md(prompt.slice(0, 100))}_`;
   const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
   for (const item of results) {
     let media;
@@ -3205,7 +3221,7 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
       if (res.data || res.download_path) {
         const url = res.data ? null : `${STORAGE_URL}${res.download_path.startsWith("/") ? "" : "/"}${res.download_path}`;
         const media = res.data ? { type: "data_uri", value: res.data, mediaType: res.type } : { type: "url", value: url, mediaType: res.type };
-        await sendV5Media(chatId, media, withSeedCaption(`🔄 ${model.label}\n📝 _${item.prompt.slice(0, 100)}_`, res, pollResult, requestSeed),
+        await sendV5Media(chatId, media, withSeedCaption(`🔄 ${md(model.label)}\n📝 _${md(item.prompt.slice(0, 100))}_`, res, pollResult, requestSeed),
           { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] });
       }
     }
