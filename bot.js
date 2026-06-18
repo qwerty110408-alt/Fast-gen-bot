@@ -253,7 +253,7 @@ async function sendLocalMediaFile(chatId, tmp, isImage, opts) {
       await bot.sendPhoto(chatId, fs.createReadStream(tmp), opts);
     } catch (e) {
       console.warn(`[sendLocalMediaFile] sendPhoto failed, sending as document: ${e.message}`);
-      await bot.sendDocument(chatId, fs.createReadStream(tmp), {}, opts);
+      await bot.sendDocument(chatId, fs.createReadStream(tmp), opts);
     }
     return;
   }
@@ -264,7 +264,7 @@ async function sendLocalMediaFile(chatId, tmp, isImage, opts) {
     console.warn(`[sendLocalMediaFile] sendVideo failed, sending as document: ${e.message}`);
     const docOpts = { ...opts };
     delete docOpts.supports_streaming;
-    await bot.sendDocument(chatId, fs.createReadStream(tmp), {}, docOpts);
+    await bot.sendDocument(chatId, fs.createReadStream(tmp), docOpts);
   }
 }
 
@@ -2535,8 +2535,12 @@ async function scheduleVideoChunk(chatId) {
     try {
       await genOne(chatId, batchS, task.prompt, task.operation, model, false, 0, 0, task.idx, task.imageRef, true);
       job.doneSoFar++;
-    } catch {
+    } catch(e) {
       job.errorsSoFar++;
+      await bot.sendMessage(chatId,
+        `❌ Ошибка задачи ${task.idx || ""}
+${cleanErrorMessage(e, 500)}`
+      ).catch(() => {});
     }
     await bot.editMessageText(statusText(), { chat_id: chatId, message_id: job.statusMsgId, parse_mode: "Markdown" }).catch(() => {});
   }
@@ -2597,6 +2601,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     resolution: s.resolution || "720p",
     grokDuration: s.grokDuration || "6s",
     imageRef: imageRef || null,
+    imageRefs: refs || null,
     seed: s.seed,
     requestSeed,
   };
@@ -2624,12 +2629,11 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
         storeFailedTask(chatId, errKey, taskData);
         await bot.sendMessage(chatId,
           `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry} попыток.\n` +
-          `❌ *Ошибка создания задачи*${label ? ` [${label}]` : ""}\n` +
+          `❌ Ошибка создания задачи${label ? ` [${label}]` : ""}\n` +
           `🤖 ${model.label}\n${status}${errStr.slice(0, 400)}`,
           {
-            parse_mode: "Markdown",
             reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-          });
+          }).catch(() => {});
         throw lastError;
       }
 
@@ -2637,7 +2641,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
       continue;
     }
 
-    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, seed: requestSeed });
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, resolution: s.resolution || "720p", grokDuration: s.grokDuration || "6s", imageRef: imageRef || null, imageRefs: refs || null, seed: requestSeed });
 
     let results;
     try {
@@ -2691,12 +2695,11 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
         storeFailedTask(chatId, errKey, taskData);
         await bot.sendMessage(chatId,
           `⚠️ До конца часа <5 мин. Перегенерация остановлена после ${retry + 1} попыток.\n` +
-          `❌ *Ошибка генерации*${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${lastError.message.slice(0, 400)}\n` +
+          `❌ Ошибка генерации${label ? ` [${label}]` : ""}\n🤖 ${model.label}\n${lastError.message.slice(0, 400)}\n` +
           `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
           {
-            parse_mode: "Markdown",
             reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-          });
+          }).catch(() => {});
         throw lastError;
       }
 
@@ -2708,14 +2711,13 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
   // Все 5 попыток исчерпаны
   storeFailedTask(chatId, errKey, taskData);
   await bot.sendMessage(chatId,
-    `❌ *Ошибка после ${MAX_RETRIES} попыток перегенерации*${label ? ` [${label}]` : ""}\n` +
+    `❌ Ошибка после ${MAX_RETRIES} попыток перегенерации${label ? ` [${label}]` : ""}\n` +
     `🤖 ${model.label}\n` +
     `${cleanErrorMessage(lastError, 400)}\n` +
     `💳 Кредиты: ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`,
     {
-      parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать эту задачу", callback_data: `retry_err_${errKey}` }]] }
-    });
+    }).catch(() => {});
   throw lastError || new Error("Max retries exceeded");
 }
 
@@ -2726,14 +2728,14 @@ async function retryFailedTask(chatId, errKey) {
     return bot.sendMessage(chatId, "❌ Задача не найдена (возможно устарела, прошло >24ч).");
   }
 
-  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed, requestSeed } = task;
+  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, imageRefs, seed, requestSeed } = task;
 
   const fakeS = {
     ratio,
     resolution: resolution || "720p",
     grokDuration: grokDuration || "6s",
     seed: requestSeed ?? seed ?? "random",
-    pendingRefImages: [],
+    pendingRefImages: Array.isArray(imageRefs) ? imageRefs : [],
   };
 
   const statusMsg = await bot.sendMessage(chatId,
@@ -2851,7 +2853,7 @@ async function runNormal(chatId, s, prompt) {
             errors++;
             errorMessages.push(cleanErrorMessage(e, 350));
           }
-          bot.editMessageText(
+          await bot.editMessageText(
             `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
             { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
           ).catch(() => {});
@@ -2866,8 +2868,8 @@ async function runNormal(chatId, s, prompt) {
             errors++;
             errorMessages.push(cleanErrorMessage(e, 350));
           })
-          .finally(() => {
-            bot.editMessageText(
+          .finally(async () => {
+            await bot.editMessageText(
               `⏳ Прогресс: ✓${done}/${count}${errors > 0 ? ` ✗${errors}` : ""}\n🎨 ${model.label}`,
               { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
             ).catch(() => {});
@@ -2967,6 +2969,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
     resolution: s.resolution || "720p",
     grokDuration: s.grokDuration || "6s",
     imageRef: imageRef || null,
+    imageRefs: refs || null,
     seed: s.seed,
     requestSeed,
   };
@@ -2993,7 +2996,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
       continue;
     }
 
-    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, seed: requestSeed });
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, resolution: s.resolution || "720p", grokDuration: s.grokDuration || "6s", imageRef: imageRef || null, imageRefs: refs || null, seed: requestSeed });
 
     try {
       const pollResult = await v5Poll(genId);
@@ -3022,12 +3025,11 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
   // Все 5 попыток исчерпаны — пропускаем задачу, не блокируем пакет
   storeFailedTask(chatId, errKey, taskData);
   const failMsg =
-    `❌ *Пропущена задача ${batchIdx || ""}* (5 попыток)\n` +
+    `❌ Пропущена задача ${batchIdx || ""} (5 попыток)\n` +
     `🤖 ${model.label}\n` +
     `${cleanErrorMessage(lastError, 300)}\n` +
     `💳 ${lastRefunded ? "✅ возвращены" : "❌ потрачены"}`;
   bot.sendMessage(chatId, failMsg, {
-    parse_mode: "Markdown",
     reply_markup: { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: `retry_err_${errKey}` }]] }
   }).catch(() => {});
   throw lastError || new Error("Max retries exceeded");
@@ -3131,6 +3133,7 @@ async function runBatch(chatId) {
 
   const queue = isImage ? imageQueue : videoQueue;
   let done = 0, errors = 0;
+  const errorMessages = [];
   const statusMsg = await bot.sendMessage(chatId,
     `📦 *Пакетный режим*\nЗадач: ${total} | 🤖 ${model.label}\n💳 ${model.credits}`,
     { parse_mode: "Markdown" });
@@ -3164,6 +3167,7 @@ async function runBatch(chatId) {
           done++;
         } catch(e) {
           errors++;
+          errorMessages.push(`Задача ${task.idx || idx + 1}: ${cleanErrorMessage(e, 300)}`);
           console.error(`[batch ordered] task ${idx} failed: ${e.message}`);
         }
         bot.editMessageText(
@@ -3178,7 +3182,7 @@ async function runBatch(chatId) {
     const allTasks = tasks.map(task =>
       queue(() => genOne(chatId, batchS, task.prompt, task.operation, task.model || model, isImage, 0, 0, task.idx, task.imageRef || null, false))
         .then(() => done++)
-        .catch(() => errors++)
+        .catch((e) => { errors++; errorMessages.push(`Задача ${task.idx}: ${cleanErrorMessage(e, 300)}`); console.error(`[batch video] task ${task.idx} failed: ${e.message}`); })
         .finally(() => {
           bot.editMessageText(
             `📦 Пакет: ✓${done}/${total}${errors > 0 ? ` ✗${errors}` : ""}`,
@@ -3189,8 +3193,14 @@ async function runBatch(chatId) {
     await Promise.allSettled(allTasks);
   }
 
+  const batchFinalText = errors > 0
+    ? `⚠️ Пакет готов частично: ✓${done} ✗${errors}
+
+Последняя ошибка:
+${errorMessages[0] || "см. отдельные сообщения/логи сервера"}`
+    : `✅ Пакет готов! ✓${done}`;
   await bot.editMessageText(
-    `✅ Пакет готов! ✓${done}${errors > 0 ? ` ✗${errors}` : ""}`,
+    batchFinalText,
     { chat_id: chatId, message_id: statusMsg.message_id }
   ).catch(() => {});
   s.batchPrompts = []; s.batchPhotos = []; s.batchPromptIdx = 0;
@@ -3201,21 +3211,56 @@ async function runBatch(chatId) {
 async function runRegenItem(chatId, item, isImage, modelOverride = null) {
   const modelMap = isImage ? IMAGE_MODELS : VIDEO_MODELS;
   const model = modelOverride || Object.values(modelMap).find(m => m.label === item.model) || Object.values(modelMap)[0];
-  const operation = isImage ? model.operation : model.opText;
   const s = getState(chatId);
+
+  const imageRefs = Array.isArray(item.imageRefs) ? item.imageRefs : (item.imageRef ? [item.imageRef] : []);
+  const canUseInputs = imageRefs.length > 0 && (isImage || Boolean(model.opImg));
+  const operation = item.operation && !modelOverride
+    ? item.operation
+    : (isImage ? model.operation : (canUseInputs && model.opImg ? model.opImg : model.opText));
+  const resolution = item.resolution || s.resolution || "720p";
+  const grokDuration = item.grokDuration || s.grokDuration || "6s";
+
   const statusMsg = await bot.sendMessage(chatId, `⏳ Перегенерирую...\n🎨 ${model.label}`);
   try {
     const requestSeed = makeGenerationSeed(s.seed);
-    const body = { operation, prompt: item.prompt, aspect_ratio: item.ratio || s.ratio, seed: requestSeed };
+    const body = {
+      operation,
+      prompt: item.prompt,
+      aspect_ratio: item.ratio || s.ratio,
+      seed: requestSeed,
+      ...(model.quality && { quality: model.quality }),
+      ...(canUseInputs && { inputs: imageRefs }),
+      ...(model.hasResolution && { resolution }),
+      ...(model.hasDuration && grokDuration && { duration_seconds: getGrokDurationSeconds(grokDuration) }),
+    };
+
     const created = await v5Create(body);
     const pollResult = await v5Poll(created.id);
 
     // Проверяем refunded
     if (!pollResult.usage || pollResult.usage.refunded !== true) {
-      if (isImage) spendBalance("images", 1); else spendBalance("videos", 1);
+      if (isImage) spendBalance("images", 1);
+      else {
+        const vidCost = model.hasDuration ? getGrokVideoCredits(resolution) : 1;
+        spendBalance("videos", vidCost);
+      }
     }
 
-    addHistory(chatId, { model: model.label, prompt: item.prompt, genId: created.id, operation, isImage, ratio: item.ratio || s.ratio, seed: requestSeed });
+    addHistory(chatId, {
+      model: model.label,
+      prompt: item.prompt,
+      genId: created.id,
+      operation,
+      isImage,
+      ratio: item.ratio || s.ratio,
+      resolution,
+      grokDuration,
+      imageRef: imageRefs[0] || null,
+      imageRefs,
+      seed: requestSeed,
+    });
+
     await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id });
     for (const res of pollResult.results) {
       if (res.data || res.download_path) {
@@ -3787,7 +3832,6 @@ bot.on("photo", async (msg) => {
     const dataUri = await tgPhotoToDataUri(fileId);
     s.pendingRefImages = [dataUri];
     bot.sendMessage(chatId, `✅ Фото готово!\n\n🎬 *${vm.label}* (${vm.credits})\n\nНапиши описание для видео:`, {
-      parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [
         [{ text: "🎥 Сменить модель", callback_data: "open_vidmodel" }],
         [{ text: "❌ Отмена", callback_data: "back_menu" }],
@@ -3881,7 +3925,6 @@ bot.on("message", async (msg) => {
     s.step = null;
     saveVideoProjects();
     return bot.sendMessage(chatId, `✅ Project refs подписаны.\n\n${formatVideoProjectRefsList(project.defaultRefs, "project_ref")}`, {
-      parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [[{ text: "📂 Открыть проект", callback_data: `vp_project_${projectId}` }]] }
     });
   }
@@ -3909,7 +3952,6 @@ bot.on("message", async (msg) => {
     s.step = null;
     saveVideoProjects();
     return bot.sendMessage(chatId, `✅ Prompt refs подписаны.\n\n${formatVideoProjectRefsList(prompt.refs, `prompt_${promptNo}_ref`)}`, {
-      parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [[{ text: "🧷 Prompt refs", callback_data: `vp_promptref_${projectId}_${promptId}` }]] }
     });
   }
@@ -3926,7 +3968,6 @@ bot.on("message", async (msg) => {
     saveVideoRefPresets();
     s.step = null;
     return bot.sendMessage(chatId, `✅ Custom preset создан: *${md(preset.name)}*\nLabels: ${md(preset.labels.join(", "))}`, {
-      parse_mode: "Markdown",
       reply_markup: { inline_keyboard: [[{ text: "🏷 Presets", callback_data: "vp_rpreset_back" }]] }
     });
   }
