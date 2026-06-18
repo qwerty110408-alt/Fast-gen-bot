@@ -148,10 +148,19 @@ async function v5Create(body) {
   return data;
 }
 
-// ─── Watchdog: убивает задачу если она зависла дольше WATCHDOG_MS ──
-const WATCHDOG_MS = 12 * 60 * 1000; // 12 минут
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
+// После успешной генерации storage-файл иногда становится доступен не мгновенно.
+// Поэтому отправку результата в Telegram повторяем, пока видео реально не уйдёт в чат.
+const SEND_MEDIA_ATTEMPTS = 12;
+const SEND_MEDIA_RETRY_MS = 10000;
+
+// ─── Watchdog: убивает задачу если она зависла дольше WATCHDOG_MS ──
+const WATCHDOG_MS = 15 * 60 * 1000; // 15 минут
+
+async function v5Poll(genId, maxAttempts = 180, interval = 5000) {
   const deadline = Date.now() + WATCHDOG_MS;
   for (let i = 0; i < maxAttempts; i++) {
     // Watchdog: если вышли за дедлайн — считаем задачу зависшей
@@ -172,7 +181,7 @@ async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
     }
     const st = data.status;
     console.log(`[poll] id=${genId} attempt=${i} status=${st}`);
-    if (st === "succeeded") return { results: data.results || [], usage: data.usage };
+    if (st === "succeeded") return { results: data.results || [], usage: data.usage, raw: data, seed: extractGenerationSeed(null, data, null) };
     if (st === "failed") {
       const reason = data.error || JSON.stringify(data).slice(0, 300);
       const refunded = data.usage?.refunded || false;
@@ -183,16 +192,101 @@ async function v5Poll(genId, maxAttempts = 180, interval = 10000) {
 }
 
 async function sendV5Media(chatId, media, caption, replyMarkup = null) {
-  return tgSendQueue(() => _sendV5MediaImpl(chatId, media, caption, replyMarkup));
+  return tgSendQueue(async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= SEND_MEDIA_ATTEMPTS; attempt++) {
+      try {
+        return await _sendV5MediaImpl(chatId, media, caption, replyMarkup);
+      } catch (e) {
+        lastError = e;
+        console.warn(`[sendV5Media] attempt ${attempt}/${SEND_MEDIA_ATTEMPTS} failed: ${e.message}`);
+        if (attempt < SEND_MEDIA_ATTEMPTS) await sleep(SEND_MEDIA_RETRY_MS);
+      }
+    }
+    throw lastError || new Error("sendV5Media failed");
+  });
+}
+
+function mediaExtFromUrlOrType(url, contentType, isImage) {
+  const ct = String(contentType || "").toLowerCase();
+  if (ct.includes("png")) return "png";
+  if (ct.includes("webp")) return "webp";
+  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
+  if (ct.includes("quicktime")) return "mov";
+  if (ct.includes("mp4")) return "mp4";
+  try {
+    const pathname = new URL(url).pathname;
+    const match = pathname.match(/\.([a-z0-9]{2,5})$/i);
+    if (match) return match[1].toLowerCase();
+  } catch {}
+  return isImage ? "jpg" : "mp4";
+}
+
+async function downloadMediaUrlToTemp(url, isImage) {
+  let tmp = null;
+  try {
+    const resp = await axios.get(url, {
+      responseType: "stream",
+      timeout: 5 * 60 * 1000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+    const ext = mediaExtFromUrlOrType(url, resp.headers?.["content-type"], isImage);
+    tmp = `/tmp/fg_${crypto.randomUUID()}.${ext}`;
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(tmp);
+      resp.data.on("error", reject);
+      ws.on("error", reject);
+      ws.on("finish", resolve);
+      resp.data.pipe(ws);
+    });
+    return tmp;
+  } catch (e) {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch {} }
+    throw e;
+  }
+}
+
+async function sendLocalMediaFile(chatId, tmp, isImage, opts) {
+  if (isImage) {
+    try {
+      await bot.sendPhoto(chatId, fs.createReadStream(tmp), opts);
+    } catch (e) {
+      console.warn(`[sendLocalMediaFile] sendPhoto failed, sending as document: ${e.message}`);
+      await bot.sendDocument(chatId, fs.createReadStream(tmp), {}, opts);
+    }
+    return;
+  }
+
+  try {
+    await bot.sendVideo(chatId, fs.createReadStream(tmp), opts);
+  } catch (e) {
+    console.warn(`[sendLocalMediaFile] sendVideo failed, sending as document: ${e.message}`);
+    const docOpts = { ...opts };
+    delete docOpts.supports_streaming;
+    await bot.sendDocument(chatId, fs.createReadStream(tmp), {}, docOpts);
+  }
 }
 
 async function _sendV5MediaImpl(chatId, media, caption, replyMarkup = null) {
   const isImage = media.mediaType === "image";
-  const opts = { caption, parse_mode: "Markdown", ...(replyMarkup && { reply_markup: replyMarkup }) };
+  const opts = { caption, parse_mode: "Markdown", ...(!isImage && { supports_streaming: true }), ...(replyMarkup && { reply_markup: replyMarkup }) };
 
   if (media.type === "url") {
-    if (isImage) await bot.sendPhoto(chatId, media.value, opts);
-    else await bot.sendVideo(chatId, media.value, opts);
+    try {
+      if (isImage) await bot.sendPhoto(chatId, media.value, opts);
+      else await bot.sendVideo(chatId, media.value, opts);
+      return;
+    } catch (e) {
+      console.warn(`[sendV5Media] Telegram direct URL send failed, downloading fallback: ${e.message}`);
+    }
+
+    const tmp = await downloadMediaUrlToTemp(media.value, isImage);
+    try {
+      await sendLocalMediaFile(chatId, tmp, isImage, opts);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch {}
+    }
     return;
   }
 
@@ -202,13 +296,14 @@ async function _sendV5MediaImpl(chatId, media, caption, replyMarkup = null) {
     const parts = b64.split(";base64,");
     b64 = parts[1];
     if (parts[0].includes("png")) ext = "png";
+    else if (parts[0].includes("webp")) ext = "webp";
+    else if (parts[0].includes("mp4")) ext = "mp4";
   }
   // UUID для уникальных временных файлов — исключает коллизии при параллельных задачах
   const tmp = `/tmp/fg_${crypto.randomUUID()}.${ext}`;
   fs.writeFileSync(tmp, Buffer.from(b64, "base64"));
   try {
-    if (isImage) await bot.sendPhoto(chatId, fs.createReadStream(tmp), opts);
-    else await bot.sendVideo(chatId, fs.createReadStream(tmp), opts);
+    await sendLocalMediaFile(chatId, tmp, isImage, opts);
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
   }
@@ -311,8 +406,8 @@ async function formatBalance() {
     `\n*Стоимость моделей:*\n` +
     `🖼 Imagen 4 / NanoPro / NanoBanana 2 (Flow): 4 кред\n` +
     `🖼 NanaBanana 2 (Flower) / ChatGPT / Grok: 1 кред\n` +
-    `🎬 Veo 3.1 Fast/Light/Ultra-Light/Flower/Grok 6s: 1 кред\n` +
-    `🎬 Grok Video 10s: 3 кред\n` +
+    `🎬 Veo 3.1 Fast/Light/Ultra-Light/Flower: 1 кред\n` +
+    `🎬 Grok Video 480p: 1 кред | 720p: 3 кред (6с/10с)\n` +
     `🎬 Omni Flash 4-8s: 1 кред | 10s: 2 кред\n` +
     `🎬 Veo 3.1 Quality: 10 кред ⚠️\n` +
     `\nОбновлено: ${new Date().toLocaleTimeString("ru")}`
@@ -331,12 +426,16 @@ const IMAGE_MODELS = {
 };
 
 const GROK_DURATIONS = {
-  "6s":  { label: "6 сек (1 кред)",  duration: "6s",  credits: "1 кред/видео" },
-  "10s": { label: "10 сек (3 кред)", duration: "10s", credits: "3 кред/видео" },
+  "6s":  { label: "6 сек",  seconds: 6 },
+  "10s": { label: "10 сек", seconds: 10 },
 };
 
-function getGrokVideoCredits(duration) {
-  return duration === "10s" ? 3 : 1;
+function getGrokDurationSeconds(duration) {
+  return GROK_DURATIONS[duration]?.seconds || 6;
+}
+
+function getGrokVideoCredits(resolution) {
+  return resolution === "720p" ? 3 : 1;
 }
 
 const VIDEO_MODELS = {
@@ -345,7 +444,7 @@ const VIDEO_MODELS = {
   "veo_ultra":  { label: "Veo 3.1 Ultra-Light", opText: "flow_video_ultra_light_from_text", opImg: "flow_video_ultra_light_from_ingredients", opKf: "flow_video_ultra_light_from_keyframes", credits: "1 кред/видео" },
   "veo_qual":   { label: "Veo 3.1 Quality",     opText: "flow_video_quality_from_text", opImg: null,                                  opKf: "flow_video_quality_from_keyframes", credits: "10 кред/видео ⚠️" },
   "flower_vid": { label: "Veo 3.1 Flower",      opText: "flower_video_from_text",       opImg: "flower_video_from_image",             opKf: null,                                credits: "1 кред/видео" },
-  "grok_vid":   { label: "Grok Video",          opText: "grok_video_from_text",         opImg: "grok_video_from_image",               opKf: null,                                credits: "1/3 кред/видео", hasResolution: true, hasDuration: true },
+  "grok_vid":   { label: "Grok Video",          opText: "grok_video_from_text",         opImg: "grok_video_from_image",               opKf: null,                                credits: "480p: 1 кред | 720p: 3 кред", hasResolution: true, hasDuration: true },
   "omni_4s":    { label: "Omni Flash 4s",       opText: "flow_video_omni_flash_from_text_4s",  opImg: "flow_video_omni_flash_from_ingredients_4s",  opKf: null, credits: "1 кред/видео" },
   "omni_6s":    { label: "Omni Flash 6s",       opText: "flow_video_omni_flash_from_text_6s",  opImg: "flow_video_omni_flash_from_ingredients_6s",  opKf: null, credits: "1 кред/видео" },
   "omni_8s":    { label: "Omni Flash 8s",       opText: "flow_video_omni_flash_from_text_8s",  opImg: "flow_video_omni_flash_from_ingredients_8s",  opKf: null, credits: "1 кред/видео" },
@@ -522,6 +621,84 @@ function cut(text, max = 180) {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
+const FASTGEN_MAX_SEED = 2147483647;
+
+function makeGenerationSeed(seedMode = "random") {
+  const explicitSeed = normalizeSeedValue(seedMode);
+  if (explicitSeed !== null) return explicitSeed;
+  const mode = String(seedMode || "random").toLowerCase();
+  if (mode === "fixed") return 42;
+  return crypto.randomInt(0, FASTGEN_MAX_SEED + 1);
+}
+
+function normalizeSeedValue(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (Number.isSafeInteger(num) && num >= 0 && num <= FASTGEN_MAX_SEED) return num;
+    }
+  }
+  return null;
+}
+
+function extractGenerationSeed(resultItem = null, pollResult = null, requestedSeed = null) {
+  const raw = pollResult?.raw || pollResult || {};
+  const candidates = [
+    resultItem?.seed,
+    resultItem?.actual_seed,
+    resultItem?.actualSeed,
+    resultItem?.generation_seed,
+    resultItem?.generationSeed,
+    resultItem?.request_seed,
+    resultItem?.requestSeed,
+    resultItem?.metadata?.seed,
+    resultItem?.metadata?.actual_seed,
+    resultItem?.metadata?.actualSeed,
+    resultItem?.metadata?.generation_seed,
+    resultItem?.metadata?.generationSeed,
+    resultItem?.metadata?.request_seed,
+    resultItem?.metadata?.requestSeed,
+    pollResult?.seed,
+    pollResult?.actual_seed,
+    pollResult?.actualSeed,
+    pollResult?.generation_seed,
+    pollResult?.generationSeed,
+    pollResult?.metadata?.seed,
+    pollResult?.metadata?.actual_seed,
+    pollResult?.metadata?.actualSeed,
+    raw.seed,
+    raw.actual_seed,
+    raw.actualSeed,
+    raw.generation_seed,
+    raw.generationSeed,
+    raw.request_seed,
+    raw.requestSeed,
+    raw.metadata?.seed,
+    raw.metadata?.actual_seed,
+    raw.metadata?.actualSeed,
+    requestedSeed,
+  ];
+
+  for (const value of candidates) {
+    const normalized = normalizeSeedValue(value);
+    if (normalized !== null) return normalized;
+  }
+  return null;
+}
+
+function seedCaptionLine(resultItem = null, pollResult = null, requestedSeed = null) {
+  const seed = extractGenerationSeed(resultItem, pollResult, requestedSeed);
+  return seed === null ? "" : `\n🌱 Seed: \`${md(seed)}\``;
+}
+
+function withSeedCaption(caption, resultItem = null, pollResult = null, requestedSeed = null) {
+  return `${caption}${seedCaptionLine(resultItem, pollResult, requestedSeed)}`;
+}
+
 function utcHourKey(ts = Date.now()) {
   const d = new Date(ts);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}T${String(d.getUTCHours()).padStart(2, "0")}:00Z`;
@@ -558,6 +735,7 @@ function normalizeVideoProject(project) {
   project.ratio = project.ratio || "16:9";
   project.resolution = project.resolution || "720p";
   project.grokDuration = project.grokDuration || "6s";
+  project.seed = project.seed || "random";
   project.name = project.name || `Project ${project.id}`;
   return project;
 }
@@ -997,6 +1175,7 @@ function createVideoProject(chatId, draft) {
     ratio: s.ratio || "16:9",
     resolution: s.resolution || "720p",
     grokDuration: s.grokDuration || "6s",
+    seed: s.seed || "random",
   };
   videoProjects[id] = project;
   saveVideoProjects();
@@ -1244,7 +1423,8 @@ function showVideoProjectSettings(chatId, msgId = null) {
     `Новые проекты берут текущие настройки бота:\n` +
     `📐 Ratio: *${s.ratio}*\n` +
     `🖥 Grok resolution: *${s.resolution || "720p"}*\n` +
-    `⏱ Grok duration: *${s.grokDuration || "6s"}*\n\n` +
+    `⏱ Grok duration: *${s.grokDuration || "6s"}*\n` +
+    `🌱 Seed mode: *${s.seed === "fixed" ? "fixed 42" : "random numeric"}*\n\n` +
     `Лимит хранения refs: *${VIDEO_PROJECT_MAX_REFS}* на project fallback и prompt. При генерации бот автоматически режет refs до лимита выбранной модели: Grok до 7, Veo/Flow до 3, Flower до 1. Presets меняют подписи refs, Clone refs копирует refs между prompts.`;
   const kb = { inline_keyboard: [
     [{ text: "📐 Change ratio", callback_data: "open_ratio" }],
@@ -1351,6 +1531,11 @@ async function generateVideoProjectPrompt(projectId, promptId) {
     return;
   }
 
+  const requestSeed = normalizeSeedValue(promptItem.seed) ?? makeGenerationSeed(project.seed || "random");
+  promptItem.seed = requestSeed;
+  project.updatedAt = Date.now();
+  saveVideoProjects();
+
   let lastError = null;
   while ((promptItem.retries || 0) < VIDEO_PROJECT_MAX_RETRIES) {
     let genId = null;
@@ -1359,9 +1544,10 @@ async function generateVideoProjectPrompt(projectId, promptId) {
         operation,
         prompt: `${promptItem.prompt}${videoProjectRefsPromptBlock(refs, refPrefix)}`,
         aspect_ratio: project.ratio || "16:9",
+        seed: requestSeed,
         ...(apiInputs.length > 0 && { inputs: apiInputs }),
         ...(model.hasResolution && { resolution: project.resolution || "720p" }),
-        ...(model.hasDuration && project.grokDuration && { duration: project.grokDuration }),
+        ...(model.hasDuration && project.grokDuration && { duration_seconds: getGrokDurationSeconds(project.grokDuration) }),
       };
 
       const created = await v5Create(body);
@@ -1373,7 +1559,7 @@ async function generateVideoProjectPrompt(projectId, promptId) {
 
       const pollResult = await v5Poll(genId);
       if (!pollResult.usage || pollResult.usage.refunded !== true) {
-        const cost = model.hasDuration ? getGrokVideoCredits(project.grokDuration || "6s") : 1;
+        const cost = model.hasDuration ? getGrokVideoCredits(project.resolution || "720p") : 1;
         spendBalance("videos", cost);
       }
 
@@ -1388,7 +1574,7 @@ async function generateVideoProjectPrompt(projectId, promptId) {
           media = { type: "url", value: resultUrl, mediaType: item.type || "video" };
         }
         if (!media) continue;
-        resultItems.push({ type: item.type || "video", url: resultUrl, hasData: Boolean(item.data), download_path: item.download_path || null });
+        resultItems.push({ type: item.type || "video", url: resultUrl, hasData: Boolean(item.data), download_path: item.download_path || null, seed: extractGenerationSeed(item, pollResult, requestSeed) });
       }
 
       promptItem.status = "completed";
@@ -1414,10 +1600,10 @@ async function generateVideoProjectPrompt(projectId, promptId) {
           const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
           media = { type: "url", value: url, mediaType: item.type || "video" };
         }
-        if (media) await sendV5Media(project.chatId, media, caption);
+        if (media) await sendV5Media(project.chatId, media, withSeedCaption(caption, item, pollResult, requestSeed));
       }
 
-      addHistory(project.chatId, { model: model.label, prompt: promptItem.prompt, genId, operation, isImage: false, ratio: project.ratio, projectId: project.id });
+      addHistory(project.chatId, { model: model.label, prompt: promptItem.prompt, genId, operation, isImage: false, ratio: project.ratio, projectId: project.id, seed: requestSeed });
       addVideoProjectHistory(project.chatId, {
         projectId: project.id,
         projectName: project.name,
@@ -1425,6 +1611,7 @@ async function generateVideoProjectPrompt(projectId, promptId) {
         prompt: promptItem.prompt,
         model: model.label,
         genId,
+        seed: requestSeed,
         result: resultItems[0] || null,
       });
       completeVideoProjectIfFinished(projectId);
@@ -1958,10 +2145,10 @@ function showMiscMenu(chatId, msgId = null) {
 function showGrokDurationMenu(chatId, msgId = null) {
   const s = getState(chatId);
   const cur = s.grokDuration || "6s";
-  const text = `⏱ *Длительность Grok Video*\n\n6 сек = 1 кред\n10 сек = 3 кред`;
+  const text = `⏱ *Длительность Grok Video*\n\nДоступно: 6 сек и 10 сек.\nСтоимость зависит от разрешения: 480p = 1 кред, 720p = 3 кред.`;
   const kb = { inline_keyboard: [
-    [{ text: cur === "6s" ? "✅ 6 сек (1 кред)" : "6 сек (1 кред)", callback_data: "set_grok_dur_6s" },
-     { text: cur === "10s" ? "✅ 10 сек (3 кред)" : "10 сек (3 кред)", callback_data: "set_grok_dur_10s" }],
+    [{ text: cur === "6s" ? "✅ 6 сек" : "6 сек", callback_data: "set_grok_dur_6s" },
+     { text: cur === "10s" ? "✅ 10 сек" : "10 сек", callback_data: "set_grok_dur_10s" }],
     [{ text: "◀️ Назад", callback_data: "open_misc" }],
   ]};
   if (msgId) bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown", reply_markup: kb }).catch(() => {});
@@ -1997,7 +2184,7 @@ function showBatchSettingsMenu(chatId, msgId = null) {
 
   const ratioRows = [RATIOS.map(r => ({ text: `${ratio === r ? "✅ " : ""}${r}`, callback_data: `bset_ratio_${r.replace(":", "x")}` }))];
   const resRow = !isImage && isGrok ? [["480p", "720p"].map(r => ({ text: `${resolution === r ? "✅ " : ""}${r}`, callback_data: `bset_res_${r}` }))] : [];
-  const durRow = !isImage && isGrok ? [["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с(1кр)" : "10с(3кр)"}`, callback_data: `bset_dur_${d}` }))] : [];
+  const durRow = !isImage && isGrok ? [["6s", "10s"].map(d => ({ text: `${grokDuration === d ? "✅ " : ""}${d === "6s" ? "6с" : "10с"}`, callback_data: `bset_dur_${d}` }))] : [];
 
   const kb = { inline_keyboard: [
     ...modelRows,
@@ -2379,14 +2566,16 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
   const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const MAX_RETRIES = 5;
 
+  const requestSeed = makeGenerationSeed(s.seed);
+
   const body = {
     operation,
     prompt,
     aspect_ratio: s.ratio,
-    ...(s.seed === "fixed" && { seed: 42 }),
+    seed: requestSeed,
     ...(model.quality && { quality: model.quality }),
     ...(model.hasResolution && { resolution: s.resolution || "720p" }),
-    ...(model.hasDuration && s.grokDuration && { duration: s.grokDuration }),
+    ...(model.hasDuration && s.grokDuration && { duration_seconds: getGrokDurationSeconds(s.grokDuration) }),
   };
 
   const refs = imageRef ? [imageRef] : (s.pendingRefImages && s.pendingRefImages.length > 0 ? s.pendingRefImages : null);
@@ -2403,6 +2592,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
     grokDuration: s.grokDuration || "6s",
     imageRef: imageRef || null,
     seed: s.seed,
+    requestSeed,
   };
 
   let lastError = null;
@@ -2441,7 +2631,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
       continue;
     }
 
-    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio });
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, seed: requestSeed });
 
     let results;
     try {
@@ -2453,7 +2643,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
       if (!usage || usage.refunded !== true) {
         if (isImage) spendBalance("images", 1);
         else {
-          const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
+          const vidCost = model.hasDuration ? getGrokVideoCredits(s.resolution || "720p") : 1;
           spendBalance("videos", vidCost);
         }
       }
@@ -2470,7 +2660,7 @@ async function genOne(chatId, s, prompt, operation, model, isImage, index, total
             const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
             media = { type: "url", value: url, mediaType: item.type || (isImage ? "image" : "video") };
           }
-          if (media) await sendV5Media(chatId, media, caption, regenKb);
+          if (media) await sendV5Media(chatId, media, withSeedCaption(caption, item, pollResult, requestSeed), regenKb);
         }
       } catch(e) {
         console.error(`[genOne] sendMedia failed genId=${genId}: ${e.message}`);
@@ -2530,13 +2720,13 @@ async function retryFailedTask(chatId, errKey) {
     return bot.sendMessage(chatId, "❌ Задача не найдена (возможно устарела, прошло >24ч).");
   }
 
-  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed } = task;
+  const { prompt, operation, model, isImage, ratio, resolution, grokDuration, imageRef, seed, requestSeed } = task;
 
   const fakeS = {
     ratio,
     resolution: resolution || "720p",
     grokDuration: grokDuration || "6s",
-    seed: seed || "random",
+    seed: requestSeed ?? seed ?? "random",
     pendingRefImages: [],
   };
 
@@ -2698,13 +2888,14 @@ async function runKeyframes(chatId, s, prompt) {
       if (s.keyframeStart) inputs.push(await tgPhotoToDataUri(s.keyframeStart));
       if (s.keyframeEnd) inputs.push(await tgPhotoToDataUri(s.keyframeEnd));
 
+      const requestSeed = makeGenerationSeed(s.seed);
       const body = {
         operation: model.opKf,
         prompt: finalPrompt,
         aspect_ratio: s.ratio,
         inputs,
         keyframes: true,
-        ...(s.seed === "fixed" && { seed: 42 }),
+        seed: requestSeed,
       };
       const created = await v5Create(body);
       const pollResult = await v5Poll(created.id);
@@ -2721,7 +2912,7 @@ async function runKeyframes(chatId, s, prompt) {
           const media = item.data
             ? { type: "data_uri", value: item.data, mediaType: "video" }
             : { type: "url", value: url, mediaType: "video" };
-          await sendV5Media(chatId, media, `🎞 Ключ. кадры\n📝 _${finalPrompt.slice(0, 100)}_`);
+          await sendV5Media(chatId, media, withSeedCaption(`🎞 Ключ. кадры\n📝 _${finalPrompt.slice(0, 100)}_`, item, pollResult, requestSeed));
         }
       }
     } catch(e) {
@@ -2739,14 +2930,16 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
   const errKey = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const MAX_RETRIES = 5;
 
+  const requestSeed = makeGenerationSeed(s.seed);
+
   const body = {
     operation,
     prompt,
     aspect_ratio: s.ratio,
-    ...(s.seed === "fixed" && { seed: 42 }),
+    seed: requestSeed,
     ...(model.quality && { quality: model.quality }),
     ...(model.hasResolution && { resolution: s.resolution || "720p" }),
-    ...(model.hasDuration && s.grokDuration && { duration: s.grokDuration }),
+    ...(model.hasDuration && s.grokDuration && { duration_seconds: getGrokDurationSeconds(s.grokDuration) }),
   };
 
   const refs = imageRef ? [imageRef] : (s.pendingRefImages && s.pendingRefImages.length > 0 ? s.pendingRefImages : null);
@@ -2759,6 +2952,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
     grokDuration: s.grokDuration || "6s",
     imageRef: imageRef || null,
     seed: s.seed,
+    requestSeed,
   };
 
   let lastError = null;
@@ -2783,19 +2977,19 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
       continue;
     }
 
-    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio });
+    addHistory(chatId, { model: model.label, prompt, genId, operation, isImage, ratio: s.ratio, seed: requestSeed });
 
     try {
       const pollResult = await v5Poll(genId);
       if (!pollResult.usage || pollResult.usage.refunded !== true) {
         if (isImage) spendBalance("images", 1);
         else {
-          const vidCost = model.hasDuration ? getGrokVideoCredits(s.grokDuration || "6s") : 1;
+          const vidCost = model.hasDuration ? getGrokVideoCredits(s.resolution || "720p") : 1;
           spendBalance("videos", vidCost);
         }
       }
       // Возвращаем данные для отправки — НЕ отправляем здесь
-      return { results: pollResult.results, prompt, model, batchIdx };
+      return { results: pollResult.results, prompt, model, batchIdx, requestSeed, pollResult };
     } catch(e) {
       const errMsg = e.message || "";
       const refundedMatch = errMsg.match(/REFUNDED:(true|false)/);
@@ -2825,7 +3019,7 @@ async function genOneRaw(chatId, s, prompt, operation, model, isImage, index, to
 
 // ─── sendBatchResult: отправляет результат genOneRaw в правильном порядке ──
 async function sendBatchResult(chatId, result, batchIdx, model) {
-  const { results, prompt } = result;
+  const { results, prompt, requestSeed, pollResult } = result;
   const idxStr = batchIdx ? `*${batchIdx}* ` : "";
   const caption = `${idxStr}${model.label}\n📝 _${prompt.slice(0, 100)}_`;
   const regenKb = { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] };
@@ -2836,7 +3030,7 @@ async function sendBatchResult(chatId, result, batchIdx, model) {
       const url = `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
       media = { type: "url", value: url, mediaType: item.type || "image" };
     }
-    if (media) await sendV5Media(chatId, media, caption, regenKb);
+    if (media) await sendV5Media(chatId, media, withSeedCaption(caption, item, pollResult, requestSeed), regenKb);
   }
 }
 
@@ -2995,7 +3189,8 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
   const s = getState(chatId);
   const statusMsg = await bot.sendMessage(chatId, `⏳ Перегенерирую...\n🎨 ${model.label}`);
   try {
-    const body = { operation, prompt: item.prompt, aspect_ratio: item.ratio || s.ratio, ...(s.seed === "fixed" && { seed: 42 }) };
+    const requestSeed = makeGenerationSeed(s.seed);
+    const body = { operation, prompt: item.prompt, aspect_ratio: item.ratio || s.ratio, seed: requestSeed };
     const created = await v5Create(body);
     const pollResult = await v5Poll(created.id);
 
@@ -3004,13 +3199,13 @@ async function runRegenItem(chatId, item, isImage, modelOverride = null) {
       if (isImage) spendBalance("images", 1); else spendBalance("videos", 1);
     }
 
-    addHistory(chatId, { model: model.label, prompt: item.prompt, genId: created.id, operation, isImage, ratio: item.ratio || s.ratio });
+    addHistory(chatId, { model: model.label, prompt: item.prompt, genId: created.id, operation, isImage, ratio: item.ratio || s.ratio, seed: requestSeed });
     await bot.editMessageText("✅ Перегенерировано!", { chat_id: chatId, message_id: statusMsg.message_id });
     for (const res of pollResult.results) {
       if (res.data || res.download_path) {
         const url = res.data ? null : `${STORAGE_URL}${res.download_path.startsWith("/") ? "" : "/"}${res.download_path}`;
         const media = res.data ? { type: "data_uri", value: res.data, mediaType: res.type } : { type: "url", value: url, mediaType: res.type };
-        await sendV5Media(chatId, media, `🔄 ${model.label}\n📝 _${item.prompt.slice(0, 100)}_`,
+        await sendV5Media(chatId, media, withSeedCaption(`🔄 ${model.label}\n📝 _${item.prompt.slice(0, 100)}_`, res, pollResult, requestSeed),
           { inline_keyboard: [[{ text: "🔄 Перегенерировать", callback_data: "show_regen_0" }]] });
       }
     }
@@ -3035,7 +3230,7 @@ async function checkGeneration(chatId, genId) {
         if (item.data || item.download_path) {
           const url = item.data ? null : `${STORAGE_URL}${item.download_path.startsWith("/") ? "" : "/"}${item.download_path}`;
           const media = item.data ? { type: "data_uri", value: item.data, mediaType: item.type } : { type: "url", value: url, mediaType: item.type };
-          await sendV5Media(chatId, media, "✅ Результат");
+          await sendV5Media(chatId, media, withSeedCaption("✅ Результат", item, { raw: data, results: data.results }, null));
         }
       }
     }
